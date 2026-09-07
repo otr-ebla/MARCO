@@ -119,3 +119,8 @@ wandb:
   # "online" needs `wandb login` once. Use "offline" to log to ./wandb and sync
   # later with `wandb sync`, or "disabled" to keep the calls as no-ops.
   mode: online
+
+# Applied only by train_bosco --policy-mode end-to-end.
+e2e_reward:
+  wall_kappa: 10.0       # softer wall contact penalty (guided: 30.0)
+  beta: 1.0             # stronger covered-cell travel penalty (guided: 0.5)

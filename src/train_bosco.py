@@ -58,7 +58,7 @@ from src.utils.human_curriculum import ghost_robot_probability
 
 def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
                     guide_dim: int, guide_bonus: float = 2.0,
-                    policy_mode: str = "guided") -> None:
+                    policy_mode: str = "guided", reward_weights: dict | None = None) -> None:
     """Save parameters, normalizer and the actor/reward regime for evaluation."""
     payload = {
         'update':        update,
@@ -73,6 +73,7 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         'actor_bosco_guidance': policy_mode == 'guided',
         'bosco_reward_guidance': policy_mode == 'guided',
         'guide_bonus':   float(guide_bonus),
+        'reward_weights': dict(reward_weights or {}),
     }
     # Publish only a fully-written pickle so evaluators can safely load it while
     # training continues. os.replace is atomic when source and target share a
@@ -438,6 +439,11 @@ def train(config_path: str, save_dir: str, resume: str | None,
     env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
     if policy_mode == 'end-to-end':
         guide_bonus = 0.0
+        e2e_rewards = config.get('e2e_reward', {})
+        env_cfg['wall_kappa'] = float(e2e_rewards.get('wall_kappa', 10.0))
+        env_cfg['beta'] = float(e2e_rewards.get('beta', 1.0))
+    reward_weights = {name: env_cfg[name] for name in ('wall_kappa', 'beta')
+                      if name in env_cfg}
     checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
     latest_name = LATEST_CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e_latest.pkl'
     log_name = LOG_NAME if policy_mode == 'guided' else 'training_log_e2e.csv'
@@ -476,6 +482,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
     print(f"Policy: {policy_mode}; BOSCO arrival bonus {guide_bonus} "
           f"(discovery alpha={env.alpha}, coverage growth="
           f"{env.coverage_reward_growth})")
+
+    print(f"Reward weights: wall_kappa={env.wall_kappa:g}, beta={env.beta:g}")
 
     actor = Actor(
         action_dim=action_dim,
@@ -725,7 +733,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 best_policy_score = policy_score
                 save_checkpoint(os.path.join(save_dir, checkpoint_name),
                                 update, actor_state, critic_state, carry.rms,
-                                tail_dim, guide_bonus, policy_mode)
+                                tail_dim, guide_bonus, policy_mode, reward_weights)
                 print(
                     f"  → best policy saved (complete={completion_rate:.2%}, "
                     f"coverage={mean_ep_cov:.2%}, contacts/ep="
@@ -737,7 +745,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     save_checkpoint(os.path.join(save_dir, latest_name),
                     total_updates, actor_state, critic_state, carry.rms,
-                    tail_dim, guide_bonus, policy_mode)
+                    tail_dim, guide_bonus, policy_mode, reward_weights)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms

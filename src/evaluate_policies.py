@@ -170,6 +170,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     guided = checkpoint.get("actor_bosco_guidance", True)
     env_cfg["actor_bosco_guidance"] = guided
     env_cfg["bosco_reward_guidance"] = checkpoint.get("bosco_reward_guidance", True)
+    env_cfg.update(checkpoint.get("reward_weights", {}))
     vec_env = VecEnv(min(batch_size, episodes), env_cfg)
     env = vec_env.env
     if spec.kind == "marl":

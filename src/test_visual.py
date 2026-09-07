@@ -808,6 +808,7 @@ def _load_checkpoint(
         )
 
     if env_config is not None:
+        env_config.update(ckpt.get("reward_weights", {}))
         for flag in ('actor_bosco_guidance', 'bosco_reward_guidance'):
             if flag in ckpt:
                 env_config[flag] = bool(ckpt[flag])
