@@ -123,4 +123,4 @@ wandb:
 # Applied only by train_bosco --policy-mode end-to-end.
 e2e_reward:
   wall_kappa: 10.0       # softer wall contact penalty (guided: 30.0)
-  beta: 1.0             # stronger covered-cell travel penalty (guided: 0.5)
+  beta: 0.5             # restore revisit cost to isolate softer wall penalty

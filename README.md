@@ -152,7 +152,8 @@ still assumes access to nearby cells of the team's shared coverage map.
 
 End-to-end reward weights are configured separately under `e2e_reward` in
 `config/mappo_baseline.yaml`: `wall_kappa: 10.0` reduces the wall-contact penalty
-from 30, and `beta: 1.0` doubles the covered-cell travel penalty from 0.5.
+from 30, and `beta: 0.5` retains the original covered-cell travel penalty to isolate the
+effect of softer wall penalties.
 Guided training continues to use the original `env` weights. New checkpoints
 store these effective weights for evaluation and visualization. Existing policies
 need further training to learn the changed reward; loading them for visualization

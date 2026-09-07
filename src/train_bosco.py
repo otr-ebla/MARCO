@@ -424,6 +424,13 @@ LATEST_CHECKPOINT_NAME = 'checkpoint_bosco_latest.pkl'
 LOG_NAME        = 'training_log_bosco.csv'
 
 
+def policy_checkpoint_score(policy_mode, completion, coverage, contacts, reward):
+    """Rank completed-episode metrics for checkpoint selection."""
+    if policy_mode == "end-to-end":
+        return (completion, coverage, -contacts, reward)
+    return (completion, -contacts, coverage, reward)
+
+
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
@@ -441,7 +448,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
         guide_bonus = 0.0
         e2e_rewards = config.get('e2e_reward', {})
         env_cfg['wall_kappa'] = float(e2e_rewards.get('wall_kappa', 10.0))
-        env_cfg['beta'] = float(e2e_rewards.get('beta', 1.0))
+        env_cfg['beta'] = float(e2e_rewards.get('beta', 0.5))
     reward_weights = {name: env_cfg[name] for name in ('wall_kappa', 'beta')
                       if name in env_cfg}
     checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
@@ -718,14 +725,11 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'lr/actor':                       lr_a,
                     'lr/critic':                      lr_c,
                 }, step=update)
-            # Prefer deployable behaviour: task completion first, then coverage,
-            # then fewer contacts. The raw reward alone can select a fast policy
-            # that repeatedly bumps a wall and still finishes the map.
-            policy_score = (
-                completion_rate,
-                -(ep_wall_mean + ep_robot_mean + ep_human_mean),
-                mean_ep_cov,
-                mean_ep_r,
+            # End-to-end coverage comes before contacts to avoid selecting
+            # low-motion policies. Preserve the guided mode's existing ranking.
+            policy_score = policy_checkpoint_score(
+                policy_mode, completion_rate, mean_ep_cov,
+                ep_wall_mean + ep_robot_mean + ep_human_mean, mean_ep_r,
             )
             if ep_count > 0 and (
                 best_policy_score is None or policy_score > best_policy_score
