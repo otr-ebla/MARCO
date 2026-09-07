@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark BOSCO and BOSCO-guided MARL policies and make vector plots.
+"""Benchmark BOSCO and BOSCO-guided MARL policies and save result data.
 
 The default experiment evaluates 1,000 episodes for each of:
   * the learning-free BOSCO route controller without humans,
@@ -7,9 +7,10 @@ The default experiment evaluates 1,000 episodes for each of:
   * BOSCO-guided MARL trained without humans, and
   * BOSCO-guided MARL trained with eight humans.
 
-Raw episode data, aggregate statistics, run metadata, a PDF and an SVG are
-written to the output directory. MARL environments run in compiled accelerator
-batches; plain BOSCO uses the same host-side expert controller as the visual test.
+Raw episode data, aggregate statistics and run metadata are written to the output
+directory. MARL environments run in compiled accelerator batches; plain BOSCO
+uses the same host-side expert controller as the visual test. Figures are generated
+separately by ``python -m src.plot_evaluation_results``.
 """
 
 from __future__ import annotations
@@ -124,17 +125,19 @@ def _guided_initial_state(vec_env: VecEnv, key: jax.Array):
     max_tour_len = 2048
     tours = np.full((e_count, n_robots, max_tour_len), -1, np.int32)
     lens = np.zeros((e_count, n_robots), np.int32)
+    indices = np.zeros((e_count, n_robots), np.int32)
     targets = np.full((e_count, n_robots), -1, np.int32)
     assignments = np.zeros((e_count, n_robots, vec_env.grid_h, vec_env.grid_w), np.float32)
     for e, guide in enumerate(guides):
         guide.reset(pos[e])
         owner = guide.owner.reshape(vec_env.grid_h, vec_env.grid_w)
         assignments[e] = np.stack([owner == r for r in range(n_robots)])
+        targets[e], _ = guide.update(pos[e], cov[e])
         for r, tour in enumerate(guide.tours):
             length = min(len(tour), max_tour_len)
             lens[e, r] = length
             tours[e, r, :length] = tour[:length]
-        targets[e], _ = guide.update(pos[e], cov[e])
+            indices[e, r] = min(int(guide.idx[r]), length)
     graph = guides[0].graph
     coords = graph.centers[np.maximum(targets, 0)]
     target_coords = np.where((targets >= 0)[..., None], coords, pos)
@@ -146,7 +149,7 @@ def _guided_initial_state(vec_env: VecEnv, key: jax.Array):
     guide_state = JaxGuideState(
         target=jnp.asarray(targets), prev_cell=jnp.asarray(row * vec_env.grid_w + col),
         fail_cov=jnp.full((e_count, n_robots), -1, jnp.int32),
-        idx=jnp.zeros((e_count, n_robots), jnp.int32), tours=jnp.asarray(tours),
+        idx=jnp.asarray(indices), tours=jnp.asarray(tours),
         tour_lens=jnp.asarray(lens),
     )
     return state, obs, guide_state, graph
@@ -195,7 +198,21 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             else:
                 valid = guide_state.target >= 0
                 target = centers[jnp.maximum(guide_state.target, 0)]
-                delta = target - state.robot_positions
+                anchor_valid = guide_state.prev_cell >= 0
+                anchor = centers[jnp.maximum(guide_state.prev_cell, 0)]
+                anchor = jnp.where(anchor_valid[..., None], anchor,
+                                   state.robot_positions)
+                leg = target - anchor
+                leg_length = jnp.maximum(jnp.linalg.norm(leg, axis=-1), 1e-6)
+                direction = leg / leg_length[..., None]
+                progress = jnp.clip(
+                    jnp.sum((state.robot_positions - anchor) * direction, axis=-1),
+                    0.0, leg_length,
+                )
+                aim = anchor + direction * jnp.minimum(
+                    leg_length, progress + 0.25
+                )[..., None]
+                delta = aim - state.robot_positions
                 desired = jnp.arctan2(delta[..., 1], delta[..., 0])
                 angle = (desired - state.robot_headings + jnp.pi) % (2 * jnp.pi) - jnp.pi
                 turn = jnp.clip(3.0 * angle / env.omega_max, -1.0, 1.0)
@@ -204,7 +221,10 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                 # one-metre turning radius, much wider than a half-metre cell,
                 # and used to wedge the nominal BOSCO baseline into walls.  Make
                 # the adapter rotate first, then cross the next graph edge.
-                distance = jnp.linalg.norm(delta, axis=-1)
+                distance = jnp.maximum(
+                    leg_length - progress,
+                    jnp.linalg.norm(target - state.robot_positions, axis=-1),
+                )
                 speed = jnp.where(
                     jnp.abs(angle) <= 0.10,
                     jnp.clip(distance / (env.v_max * env.dt), 0.0, 1.0),
@@ -425,10 +445,20 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
     policies = list(dict.fromkeys(row["policy"] for row in rows))
     colors = plt.get_cmap("tab10").colors[:len(policies)]
     groups = [[row for row in rows if row["policy"] == p] for p in policies]
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12), constrained_layout=True)
+    fig, axes = plt.subplots(
+        3, 3, figsize=(17, 12), constrained_layout=True,
+        gridspec_kw={"width_ratios": (1.0, 1.0, 1.35)},
+    )
 
     def box(ax, field, title, scale=1.0):
-        data = [np.asarray([r[field] for r in g], float) * scale for g in groups]
+        data = []
+        for group in groups:
+            values = np.asarray([r[field] for r in group], float) * scale
+            values = values[np.isfinite(values)]
+            # Matplotlib propagates a single NaN through every box statistic.
+            # An empty finite sample remains explicit without hiding other
+            # policies that do have observations for this metric.
+            data.append(values if values.size else np.asarray([np.nan]))
         artists = ax.boxplot(data, tick_labels=policies, patch_artist=True, showfliers=False)
         for patch, color in zip(artists["boxes"], colors):
             patch.set_facecolor(color); patch.set_alpha(0.65)
@@ -475,12 +505,12 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
         avg_time = f"{times.mean():.1f}" if times.size else f"N/A (0/{len(g)})"
         table_data.append([p, *(f"{rate:.1f}%" for rate in rates), avg_time])
     table = axes[2, 2].table(cellText=table_data,
-                             colLabels=["Policy", "Success/Cov", "RRCR", "RWCR",
-                                        "RHCR", "TOR", "Avg success time (s)"], loc="center")
-    table.auto_set_font_size(False); table.set_fontsize(6.5); table.scale(1, 1.5)
+                             colLabels=["Policy", "Success/\nCov", "RRCR", "RWCR",
+                                        "RHCR", "TOR", "Avg success\ntime (s)"], loc="center")
+    table.auto_set_font_size(False); table.set_fontsize(7); table.scale(1, 1.65)
     # Policy labels are considerably longer than the numeric summary values.
     # Give their cells enough room while keeping the table within its subplot.
-    column_widths = (0.40, 0.13, 0.085, 0.085, 0.085, 0.085, 0.13)
+    column_widths = (0.42, 0.12, 0.075, 0.075, 0.075, 0.075, 0.16)
     for (row, column), cell in table.get_celld().items():
         cell.set_width(column_widths[column])
     axes[2, 2].set_title("Summary")
@@ -551,7 +581,6 @@ def main() -> None:
     summary = summarize(rows)
     summary_fields = list(dict.fromkeys(k for row in summary for k in row))
     write_csv(args.output_dir / "summary.csv", summary, summary_fields)
-    plot_results(rows, args.output_dir / "policy_benchmark")
     metadata = {
         "episodes_per_policy": args.episodes, "seed": args.seed,
         "dynamic_obstacle_evaluation_humans": args.humans,
@@ -561,7 +590,7 @@ def main() -> None:
         "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve()) if s.checkpoint else None} for s in specs],
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    print(f"Saved raw data, summary, PDF and SVG to {args.output_dir}")
+    print(f"Saved raw data, summary and metadata to {args.output_dir}")
 
 
 if __name__ == "__main__":
