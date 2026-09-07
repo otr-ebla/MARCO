@@ -1,51 +1,15 @@
 #!/usr/bin/env python3
-"""Entry point: train MAPPO under BOSCO guidance (JAX).
+"""Train MAPPO with BOSCO guidance or an end-to-end actor under CTDE.
 
-Same algorithm, environment and networks as `src.train_simple`; two things are
-added, both of them the BOSCO planner's next waypoint:
+`--policy-mode guided` preserves target deltas in actor observations and BOSCO
+reward shaping. `--policy-mode end-to-end` removes those two input channels and
+all planner-dependent rewards, including assignment-weighted discoveries.
+BOSCO targets and assignments remain available only to the centralized critic.
+Both modes share the device-side rollout, PPO, local coverage inputs and config.
 
-1. Observation. Each robot's observation gains a 4-channel egocentric encoding
-   of the cell BOSCO would send it to next — bearing (cos, sin), distance, and a
-   validity flag. The block is appended to the *tail* of the observation, after
-   the binary coverage patch, so `RunningMeanStd` (which only ever touches the
-   continuous prefix, see `rms_normalize`) leaves it alone. That is the right
-   treatment: all four channels are already O(1) and bounded by construction.
+    python -m src.train_bosco --policy-mode end-to-end --save-dir checkpoints/e2e
 
-2. Reward. A robot that actually enters the cell it was pointed at is paid
-   `--guide-bonus` on that step, on top of the environment's own difference
-   reward. The waypoint is always one move away, so this is a dense, per-agent,
-   one-step objective rather than a distant goal — which is what makes it usable
-   as shaping instead of another exploration problem.
-
-Why the waypoint has to be in the observation as well as the reward
-------------------------------------------------------------------
-Paying for arrival alone would be a non-stationary reward the policy cannot see
-the cause of: two identical observations, one of which is worth a bonus, differ
-only in the planner's hidden cursor. Feeding the same waypoint the bonus is
-computed from makes the shaped reward a function of the observation again, so it
-is learnable rather than noise. It is also the only channel that carries global
-information — the tour is planned on the whole map — into an otherwise strictly
-local, decentralised observation.
-
-Accelerator execution
----------------------
-The initial BOSCO sweep is built once on the host. Tours, cursors, dynamic
-re-routing, environment transitions, actor and critic then remain inside one
-compiled `lax.scan`; episode resets only reset device-side cursor state. PPO is
-also a compiled scan, so there is no Python or NumPy work in either hot loop.
-
-Usage
------
-    python -m src.train_bosco
-    python -m src.train_bosco --guide-bonus 4.0 --wandb-name guided
-    python -m src.pretrain_bc && \
-        python -m src.train_bosco --resume checkpoints/bc_pretrained.pkl
-
-The last form is the intended pipeline: `--resume` accepts a checkpoint from
-`src.pretrain_bc` or `src.train_simple` even though its actor is narrower, by
-zero-padding the trunk rows the guidance block feeds into. The widened actor
-computes exactly what the loaded one did, so the behaviour-cloned policy
-transfers intact and PPO learns what the waypoint is worth from there.
+Train comparison policies from scratch; actor input widths differ between modes.
 """
 
 from __future__ import annotations
@@ -93,13 +57,9 @@ from src.utils.human_curriculum import ghost_robot_probability
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
-                    guide_dim: int, guide_bonus: float = 2.0) -> None:
-    """`train_simple`'s payload plus the guidance width the actor was built for.
-
-    The extra key makes the observation layout self-describing — an actor trained
-    here does not accept a bare environment observation — and is ignored by
-    `train_simple.load_checkpoint`, so a guided checkpoint stays loadable there.
-    """
+                    guide_dim: int, guide_bonus: float = 2.0,
+                    policy_mode: str = "guided") -> None:
+    """Save parameters, normalizer and the actor/reward regime for evaluation."""
     payload = {
         'update':        update,
         'actor_params':  jax.device_get(actor_state.params),
@@ -108,7 +68,10 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         'critic_opt':    jax.device_get(critic_state.opt_state),
         'obs_rms':       jax.device_get(rms),
         'guide_dim':     int(guide_dim),
-        'bosco_guided':  True,
+        'bosco_guided':  policy_mode == 'guided',
+        'policy_mode': policy_mode,
+        'actor_bosco_guidance': policy_mode == 'guided',
+        'bosco_reward_guidance': policy_mode == 'guided',
         'guide_bonus':   float(guide_bonus),
     }
     # Publish only a fully-written pickle so evaluators can safely load it while
@@ -181,7 +144,7 @@ class GuidedCarry(NamedTuple):
     """Rollout state threaded between updates."""
 
     env_state: object
-    obs:       jax.Array      # already carries the guidance block
+    obs:       jax.Array      # actor inputs for the selected policy mode
     gstate:    object
     rms:       object
     guide_state: JaxGuideState
@@ -463,12 +426,21 @@ LOG_NAME        = 'training_log_bosco.csv'
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
-          num_envs: int | None = None):
+          num_envs: int | None = None, policy_mode: str = "guided"):
+    if policy_mode not in ('guided', 'end-to-end'):
+        raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
     device = select_device(backend)
     print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
 
-    env_cfg   = config.get('env',   {})
+    env_cfg = config.setdefault('env', {})
+    env_cfg['actor_bosco_guidance'] = policy_mode == 'guided'
+    env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
+    if policy_mode == 'end-to-end':
+        guide_bonus = 0.0
+    checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
+    latest_name = LATEST_CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e_latest.pkl'
+    log_name = LOG_NAME if policy_mode == 'guided' else 'training_log_e2e.csv'
     if num_humans > 0:
         env_cfg['num_humans'] = num_humans
     model_cfg = config.get('model', {})
@@ -488,9 +460,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
     E          = vec_env.E
     N          = vec_env.num_robots
     action_dim = vec_env.action_dim
-    # The guidance block rides in the observation tail, where the actor's `patch`
-    # slice picks it up and feeds it straight to the trunk alongside the binary
-    # coverage patch. Both are inputs no normaliser should touch.
     tail_dim = env.patch_dim
     obs_dim = env.obs_dim
 
@@ -504,7 +473,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           f" + {vec_env.critic_vec_dim}")
     print(f"Coverable cells: {int(env.free_totals[0])} / {env.num_cells} "
           f"({env.free_totals[0] / env.num_cells:.1%} of the grid)")
-    print(f"Guidance: BOSCO next-cell waypoint, arrival bonus {guide_bonus} "
+    print(f"Policy: {policy_mode}; BOSCO arrival bonus {guide_bonus} "
           f"(discovery alpha={env.alpha}, coverage growth="
           f"{env.coverage_reward_growth})")
 
@@ -521,9 +490,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
         map_embed=model_cfg.get('critic_map_embed', 128),
     )
     mappo = MAPPO(actor, critic, vec_env, train_cfg, device=device)
-    # `MAPPO.create_train_states` sizes its dummy observation from `vec_env`,
-    # which knows nothing about the guidance block; the actor is initialised here
-    # against the real width instead.
     mappo.env = vec_env
 
     T             = train_cfg.get('rollout_steps',  256)
@@ -548,7 +514,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     carry = rollout.start(reset_key)
 
     os.makedirs(save_dir, exist_ok=True)
-    log_path = os.path.join(save_dir, LOG_NAME)
+    log_path = os.path.join(save_dir, log_name)
 
     start_update = 1
     if resume:
@@ -571,6 +537,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
             'coverable_cells':  int(env.free_totals[0]),
             'steps_per_update': T * E,
             'guide_bonus':      guide_bonus,
+            'policy_mode':      policy_mode,
             
         },
     )
@@ -756,9 +723,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 best_policy_score is None or policy_score > best_policy_score
             ):
                 best_policy_score = policy_score
-                save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
+                save_checkpoint(os.path.join(save_dir, checkpoint_name),
                                 update, actor_state, critic_state, carry.rms,
-                                tail_dim, guide_bonus)
+                                tail_dim, guide_bonus, policy_mode)
                 print(
                     f"  → best policy saved (complete={completion_rate:.2%}, "
                     f"coverage={mean_ep_cov:.2%}, contacts/ep="
@@ -768,9 +735,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     run.summary['best_mean_ep_reward'] = mean_ep_r
                     run.summary['best_update'] = update
 
-    save_checkpoint(os.path.join(save_dir, LATEST_CHECKPOINT_NAME),
+    save_checkpoint(os.path.join(save_dir, latest_name),
                     total_updates, actor_state, critic_state, carry.rms,
-                    tail_dim, guide_bonus)
+                    tail_dim, guide_bonus, policy_mode)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms
@@ -783,13 +750,14 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(
         description='Train MAPPO for indoor coverage under BOSCO waypoint guidance')
+    parser.add_argument('--policy-mode', choices=['guided', 'end-to-end'],
+                        default='guided', help='Actor guidance and reward regime; critic retains BOSCO state')
     parser.add_argument('--config',   default=_default_cfg,
                         help='Path to YAML config file')
     parser.add_argument('--save-dir', default=_default_save,
                         help='Directory for checkpoints and training log')
     parser.add_argument('--resume',   default=None,
-                        help='Checkpoint to resume from; a non-guided actor '
-                             '(src.pretrain_bc / src.train_simple) is widened')
+                        help='Checkpoint with matching actor architecture to resume from')
     parser.add_argument('--guide-bonus', type=float, default=10.0,
                         help='Reward paid to a robot that enters the cell BOSCO '
                              'pointed it at. Keep it below the environment\'s '
@@ -825,4 +793,4 @@ if __name__ == '__main__':
               'name':    args.wandb_name,
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
-          }, num_humans=args.humans, num_envs=args.envs)
+          }, num_humans=args.humans, num_envs=args.envs, policy_mode=args.policy_mode)

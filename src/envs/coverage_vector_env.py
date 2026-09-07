@@ -75,6 +75,8 @@ class MultiRobotCoverageEnv:
         self.v_max           = float(cfg.get('v_max',           1.0))
         self.omega_max       = float(cfg.get('omega_max',       1.0))
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
+        self.actor_bosco_guidance = bool(cfg.get('actor_bosco_guidance', True))
+        self.bosco_reward_guidance = bool(cfg.get('bosco_reward_guidance', True))
         self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
         self.local_coverage_size = int(cfg.get('local_coverage_size', 5))
         if self.local_coverage_size <= 0 or self.local_coverage_size % 2 == 0:
@@ -166,7 +168,7 @@ class MultiRobotCoverageEnv:
         self.room_totals = jnp.sum(self.room_masks, axis=(2, 3))     # (M, 1)
 
         # -- Derived dims --
-        self.obs_vec_dim   = 2 + 2 + self.k_teammates * 2  # v, w, bosco_delta, teammates
+        self.obs_vec_dim   = 2 + 2 * int(self.actor_bosco_guidance) + self.k_teammates * 2
         self.patch_dim     = (
             self.local_coverage_size ** 2 if self.use_local_coverage_obs else 0
         )
@@ -547,6 +549,8 @@ class MultiRobotCoverageEnv:
         assigned_discovery = discovered & (
             state.cell_assignments[ids, rows, cols] > 0.5
         )
+        if not self.bosco_reward_guidance:
+            assigned_discovery = discovered
         unassigned_discovery = discovered & ~assigned_discovery
         redundant  = moved & ~discovered
         travelled = jnp.linalg.norm(new_pos - state.robot_positions, axis=-1)
@@ -586,6 +590,10 @@ class MultiRobotCoverageEnv:
             * (dist_to_bosco_next / self.cell_size) ** 2
             * bosco_active
         )
+
+        if not self.bosco_reward_guidance:
+            bosco_reward_term = jnp.zeros_like(bosco_reward_term)
+            bosco_distance_cost = jnp.zeros_like(bosco_distance_cost)
 
         v_norm = v_cmds / self.v_max
         omega_norm = omega_cmds / self.omega_max
@@ -663,7 +671,9 @@ class MultiRobotCoverageEnv:
         local_dy = -global_dx * s + global_dy * c
         bosco_delta = jnp.stack([local_dx, local_dy], axis=-1)
         
-        parts = [state.robot_velocities, bosco_delta]
+        parts = [state.robot_velocities]
+        if self.actor_bosco_guidance:
+            parts.append(bosco_delta)
 
         rel = state.robot_positions[None, :, :] - state.robot_positions[:, None, :]
         if self._k_eff > 0:

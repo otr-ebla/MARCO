@@ -161,13 +161,18 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     if spec.checkpoint is not None and not spec.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {spec.checkpoint}")
     config, env_cfg = _env_config(config_path, spec.humans, max_steps)
-    vec_env = VecEnv(min(batch_size, episodes), env_cfg)
-    env = vec_env.env
     actor = params = rms = None
+    checkpoint = {}
     if spec.kind == "marl":
         assert spec.checkpoint is not None
         with spec.checkpoint.open("rb") as handle:
             checkpoint = pickle.load(handle)
+    guided = checkpoint.get("actor_bosco_guidance", True)
+    env_cfg["actor_bosco_guidance"] = guided
+    env_cfg["bosco_reward_guidance"] = checkpoint.get("bosco_reward_guidance", True)
+    vec_env = VecEnv(min(batch_size, episodes), env_cfg)
+    env = vec_env.env
+    if spec.kind == "marl":
         model_cfg = config.get("model", {})
         actor = Actor(action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
                       n_rays=env.n_rays, tail_dim=env.patch_dim,
@@ -175,13 +180,18 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                       hidden_size=model_cfg.get("hidden_size", 128))
         params = jax.device_put(checkpoint["actor_params"], device)
         rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))
-    state, obs, guide_state, graph = _guided_initial_state(
-        vec_env, jax.random.PRNGKey(seed)
-    )
-    neighbors = jnp.asarray(graph.neighbors, jnp.int32)
-    free = jnp.asarray(graph.free, jnp.bool_)
-    components = jnp.asarray(graph.component, jnp.int32)
-    centers = jnp.asarray(graph.centers, jnp.float32)
+    if guided:
+        state, obs, guide_state, graph = _guided_initial_state(
+            vec_env, jax.random.PRNGKey(seed)
+        )
+        neighbors = jnp.asarray(graph.neighbors, jnp.int32)
+        free = jnp.asarray(graph.free, jnp.bool_)
+        components = jnp.asarray(graph.component, jnp.int32)
+        centers = jnp.asarray(graph.centers, jnp.float32)
+    else:
+        state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
+        guide_state = None
+
 
     def run_chunk(carry, keys):
         def one(c, action_key):
@@ -233,7 +243,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                 actions = jnp.stack([2.0 * speed - 1.0, turn], axis=-1)
                 actions = jnp.where(valid[..., None], actions,
                                     jnp.array([-1.0, 0.0], jnp.float32))
-            next_state, _, rewards, term, done, info, _ = vec_env.step(state, actions)
+            next_state, next_obs, rewards, term, done, info, _ = vec_env.step(state, actions)
             previous_col = jnp.clip(
                 (state.robot_positions[..., 0] / env.cell_size).astype(jnp.int32),
                 0, env.grid_w - 1,
@@ -256,16 +266,18 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             covered_before = state.coverage_grid.reshape(vec_env.E, -1)
             env_ids = jnp.arange(vec_env.E)[:, None]
             revisited = entered & (covered_before[env_ids, current_cell] > 0.5)
-            next_guide, waypoint, _ = jax_guide_step(
-                guide_state, next_state.robot_positions, next_state.coverage_grid, done,
-                neighbors, vec_env.grid_w, vec_env.grid_h, env.cell_size,
-                free_cells=free, graph_components=components,
-                previous_coverage_grid=state.coverage_grid,
-            )
-            valid = waypoint >= 0
-            coords = centers[jnp.maximum(waypoint, 0)]
-            target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
-            next_state, next_obs, _ = vec_env.update_bosco(next_state, target_coords)
+            next_guide = None
+            if guided:
+                next_guide, waypoint, _ = jax_guide_step(
+                    guide_state, next_state.robot_positions, next_state.coverage_grid, done,
+                    neighbors, vec_env.grid_w, vec_env.grid_h, env.cell_size,
+                    free_cells=free, graph_components=components,
+                    previous_coverage_grid=state.coverage_grid,
+                )
+                valid = waypoint >= 0
+                coords = centers[jnp.maximum(waypoint, 0)]
+                target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
+                next_state, next_obs, _ = vec_env.update_bosco(next_state, target_coords)
             output = (rewards.sum(axis=-1), done, term, info["coverage_ratio"],
                       info["covered_cells"], info["complete"], info["timeout"],
                       info["wall_collision_rate"], info["robot_collision_rate"],
@@ -535,6 +547,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--backend", choices=("auto", "cpu", "cuda", "metal"), default="auto")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of using tanh(policy mean)")
+    parser.add_argument("--e2e-checkpoint", type=Path, default=None,
+                        help="Add an end-to-end MARL policy to the comparison")
     parser.add_argument("--skip-bosco", action="store_true")
     parser.add_argument("--skip-marl", action="store_true")
     parser.add_argument("--progress-every", type=int, default=10)
@@ -555,6 +569,9 @@ def main() -> None:
         PolicySpec("BOSCO MARL (trained: 8 humans)", "marl", args.humans,
                    args.humans8_checkpoint),
     ]
+    if args.e2e_checkpoint is not None:
+        specs.append(PolicySpec("End-to-end MARL (CTDE)", "marl", args.humans,
+                                args.e2e_checkpoint))
     if args.skip_bosco:
         specs = [s for s in specs if s.kind != "bosco"]
     if args.skip_marl:

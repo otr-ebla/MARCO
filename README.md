@@ -114,3 +114,38 @@ cd mrCPP
 pip install -r requirements.txt
 
 ---
+
+### End-to-end MARL comparison (CTDE)
+
+Train a local actor without BOSCO waypoint inputs using the same MAPPO trainer:
+
+```bash
+python -m src.train_bosco --policy-mode end-to-end --save-dir checkpoints/e2e
+```
+
+This mode removes the two target-delta channels from the actor and its observation
+normalizer. The actor retains ego velocity, configured nearby teammates, LiDAR,
+and the local coverage patch. BOSCO targets and partitions remain in the
+centralized critic's training state. Waypoint arrival bonuses, distance shaping,
+and assignment-dependent discovery weighting are disabled; every discovery earns
+full coverage credit. The existing `--policy-mode guided` remains the default.
+
+Train both policies from scratch with matching maps, humans, step budgets and
+seeds. This compares end-to-end coverage learning with the guided system; because
+both observations and rewards change, it is not an observation-only ablation.
+BOSCO information in the critic is privileged training information, so describe
+this baseline as **end-to-end MARL with a BOSCO-privileged critic**.
+
+Outputs use `checkpoint_e2e.pkl`, `checkpoint_e2e_latest.pkl`, and
+`training_log_e2e.csv`. Resume requires a matching actor architecture. Add the
+trained baseline to the standard evaluation with:
+
+```bash
+python -m src.evaluate_policies --e2e-checkpoint checkpoints/e2e/checkpoint_e2e.pkl
+```
+
+Evaluation reads the checkpoint's observation layout and executes the end-to-end
+actor without constructing or stepping a BOSCO planner. Compare coverage,
+completion, collisions and path metrics; shaped training returns differ between
+regimes and should not be used to rank them directly. The local coverage patch
+still assumes access to nearby cells of the team's shared coverage map.
