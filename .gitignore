@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 *.class
+
+# Cartella output esperimenti e benchmark
+evaluation_results/
