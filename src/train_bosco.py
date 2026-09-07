@@ -36,6 +36,7 @@ from src.algorithms.mappo import (
     rms_normalize,
     rms_update,
 )
+from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
 from src.envs.vec_env import VecEnv
 from src.models.actor_critic import Actor, Critic
 from src.train_simple import (
@@ -446,11 +447,15 @@ def train(config_path: str, save_dir: str, resume: str | None,
     env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
     if policy_mode == 'end-to-end':
         guide_bonus = 0.0
-        e2e_rewards = config.get('e2e_reward', {})
-        env_cfg['wall_kappa'] = float(e2e_rewards.get('wall_kappa', 10.0))
-        env_cfg['beta'] = float(e2e_rewards.get('beta', 0.5))
-    reward_weights = {name: env_cfg[name] for name in ('wall_kappa', 'beta')
-                      if name in env_cfg}
+        reward_weights = {**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})}
+        unknown = set(reward_weights) - set(E2E_REWARD_DEFAULTS)
+        if unknown:
+            raise ValueError(f'Unknown e2e_reward keys: {sorted(unknown)}')
+        env_cfg.update(reward_weights)
+    else:
+        env_cfg['reward_mode'] = 'legacy'
+        reward_weights = {name: env_cfg[name] for name in ('wall_kappa', 'beta')
+                          if name in env_cfg}
     checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
     latest_name = LATEST_CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e_latest.pkl'
     log_name = LOG_NAME if policy_mode == 'guided' else 'training_log_e2e.csv'
@@ -490,7 +495,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           f"(discovery alpha={env.alpha}, coverage growth="
           f"{env.coverage_reward_growth})")
 
-    print(f"Reward weights: wall_kappa={env.wall_kappa:g}, beta={env.beta:g}")
+    print(f"Reward mode: {env.reward_mode}; weights: wall_kappa={env.wall_kappa:g}, beta={env.beta:g}")
 
     actor = Actor(
         action_dim=action_dim,

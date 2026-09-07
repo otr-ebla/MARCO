@@ -121,6 +121,19 @@ wandb:
   mode: online
 
 # Applied only by train_bosco --policy-mode end-to-end.
+# beta is charged per covered-cell entry, not per moving timestep.
 e2e_reward:
-  wall_kappa: 10.0       # softer wall contact penalty (guided: 30.0)
-  beta: 0.5             # restore revisit cost to isolate softer wall penalty
+  reward_mode: local_coverage_v1
+  alpha: 10.0
+  beta: 0.25
+  tau: 0.02
+  wall_kappa: 2.0
+  kappa: 5.0
+  human_kappa: 10.0
+  completion_bonus: 50.0
+  coverage_reward_growth: 0.0
+  room_completion_bonus: 0.0
+  psi: 0.0
+  velocity_cost: 0.0
+  angular_cost: 0.0
+  action_smoothness_cost: 0.0

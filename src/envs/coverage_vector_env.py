@@ -20,6 +20,24 @@ from .map_layouts import ProceduralMapLayout, create_map_bank
 _TWO_PI = 2.0 * np.pi
 _BIG = 1.0e9
 
+# Training defaults; checkpoints persist this complete reward specification.
+E2E_REWARD_DEFAULTS = {
+    'reward_mode': 'local_coverage_v1',
+    'alpha': 10.0,
+    'beta': 0.25,  # per entry into a previously covered cell
+    'tau': 0.02,
+    'wall_kappa': 2.0,
+    'kappa': 5.0,
+    'human_kappa': 10.0,
+    'completion_bonus': 50.0,
+    'coverage_reward_growth': 0.0,
+    'room_completion_bonus': 0.0,
+    'psi': 0.0,
+    'velocity_cost': 0.0,
+    'angular_cost': 0.0,
+    'action_smoothness_cost': 0.0,
+}
+
 
 @struct.dataclass
 class EnvState:
@@ -77,6 +95,13 @@ class MultiRobotCoverageEnv:
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
         self.actor_bosco_guidance = bool(cfg.get('actor_bosco_guidance', True))
         self.bosco_reward_guidance = bool(cfg.get('bosco_reward_guidance', True))
+        self.reward_mode = cfg.get('reward_mode', 'legacy')
+        if self.reward_mode not in ('legacy', 'local_coverage_v1'):
+            raise ValueError(f'Unknown reward_mode: {self.reward_mode}')
+        if self.reward_mode == 'local_coverage_v1' and (
+            self.actor_bosco_guidance or self.bosco_reward_guidance
+        ):
+            raise ValueError('local_coverage_v1 requires an unguided end-to-end policy')
         self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
         self.local_coverage_size = int(cfg.get('local_coverage_size', 5))
         if self.local_coverage_size <= 0 or self.local_coverage_size % 2 == 0:
@@ -556,6 +581,12 @@ class MultiRobotCoverageEnv:
         travelled = jnp.linalg.norm(new_pos - state.robot_positions, axis=-1)
         nominal_step = max(self.v_max * self.dt, 1e-6)
         redundant_travel = redundant * travelled / nominal_step
+        if self.reward_mode == 'local_coverage_v1':
+            old_cols, old_rows = self._pos_to_cell(state.robot_positions)
+            entered = (cols != old_cols) | (rows != old_rows)
+            # Crossing within the same cell is free. Simultaneous discovery
+            # losers do not pay a revisit penalty for a previously unseen cell.
+            redundant_travel = (moved & entered & already & coverable).astype(jnp.float32)
 
         new_grid = prev_grid.at[rows, cols].max(
             jnp.where(moved & coverable, 1.0, 0.0)
@@ -576,6 +607,10 @@ class MultiRobotCoverageEnv:
         complete   = jnp.sum(new_grid) >= free_total - 0.5
         team_bonus = (self.room_completion_bonus * jnp.sum(newly)
                       + self.completion_bonus * complete)
+
+        if self.reward_mode == 'local_coverage_v1':
+            discovery_multiplier = 1.0
+            team_bonus = self.completion_bonus * complete
 
         dist     = jnp.sqrt(self._pairwise_sq_dist(new_pos))
         pen      = self.psi * (1.0 - dist / self._safe_dist) * (dist < self._safe_dist)

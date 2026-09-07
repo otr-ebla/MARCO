@@ -150,11 +150,41 @@ completion, collisions and path metrics; shaped training returns differ between
 regimes and should not be used to rank them directly. The local coverage patch
 still assumes access to nearby cells of the team's shared coverage map.
 
-End-to-end reward weights are configured separately under `e2e_reward` in
-`config/mappo_baseline.yaml`: `wall_kappa: 10.0` reduces the wall-contact penalty
-from 30, and `beta: 0.5` retains the original covered-cell travel penalty to isolate the
-effect of softer wall penalties.
-Guided training continues to use the original `env` weights. New checkpoints
-store these effective weights for evaluation and visualization. Existing policies
-need further training to learn the changed reward; loading them for visualization
-alone does not change their behavior.
+End-to-end training uses `local_coverage_v1`, configured under `e2e_reward`
+in `config/mappo_baseline.yaml`. Its initial reward is:
+
+| Event | Reward per robot |
+|---|---:|
+| First team discovery of a cell (one robot gets credit) | +10 |
+| Enter an already covered free cell | -0.25 |
+| Each alive timestep | -0.02 |
+| Wall contact | -2 |
+| Robot contact | -5 |
+| Human contact | -10 |
+| Team completes the map | +50 |
+
+The revisit penalty is charged on a cell transition, not on each movement step.
+Moving or turning within a covered cell has only the time cost; neither action
+has a positive motion bonus. This allows necessary travel across covered areas
+without charging five movement penalties per cell. Boundary oscillations incur
+revisit penalties and cannot regenerate discovery credit. Separate simultaneous
+collision penalties add together.
+
+Discovery credit is constant: no global coverage multiplier, room milestone
+bonus, BOSCO distance shaping, or assignment weighting. Default speed, turning,
+action smoothing and proximity costs are zero. Contact penalties remain active,
+including the larger human-contact cost. These weights are experimental and
+require evaluation; reducing contact costs does not guarantee safer behavior.
+
+Actor inputs and architecture are unchanged: velocity, LiDAR, configured local
+teammates, and the coverage patch; no target or planner-selected direction is
+added. The reward can credit observed local discoveries but cannot supply missing
+long-term memory: a feed-forward actor with a fully covered local patch may still
+struggle to find distant remaining cells. The shared coverage-map assumption
+continues to apply.
+
+New checkpoints store the reward version and all effective weights, loaded by
+numeric and visual evaluation. Old checkpoints without a version retain legacy
+reward semantics. Guided BOSCO training retains its original reward. For a clean
+experiment, train the new reward from scratch in a separate output directory;
+resuming transfers a critic and optimizer trained on the old objective.
