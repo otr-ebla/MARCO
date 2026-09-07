@@ -439,14 +439,18 @@ class MappoController:
         self.env, self.params, self.obs_rms = env, params, obs_rms
         self.guided = guided
         self.guide_bonus = float(guide_bonus)
-        self.expert = BoscoGuide(env) if guided else BoscoExpert(env)
+        self.expert = (BoscoGuide(env) if guided else
+                       BoscoExpert(env) if env.actor_bosco_guidance else None)
         self.guide_state = None
 
-        graph = self.expert.graph
-        self.graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
-        self.graph_free = jnp.asarray(graph.free, jnp.bool_)
-        self.graph_components = jnp.asarray(graph.component, jnp.int32)
-        self.graph_centers = jnp.asarray(graph.centers, jnp.float32)
+        self.graph_neighbors = self.graph_free = None
+        self.graph_components = self.graph_centers = None
+        if self.expert is not None:
+            graph = self.expert.graph
+            self.graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
+            self.graph_free = jnp.asarray(graph.free, jnp.bool_)
+            self.graph_components = jnp.asarray(graph.component, jnp.int32)
+            self.graph_centers = jnp.asarray(graph.centers, jnp.float32)
 
         @jax.jit
         def policy_step(params, rms, state, obs, guide_state,
@@ -487,6 +491,11 @@ class MappoController:
         self._fn = policy_step
 
     def reset(self, state):
+        if self.expert is None:
+            self.owner = np.full((self.env.grid_h, self.env.grid_w),
+                                 self.env.num_robots, dtype=np.int32)
+            self.obs = self.env.get_obs(state)
+            return state
         current_map_id = int(jax.device_get(state.map_id))
         positions = np.asarray(jax.device_get(state.robot_positions))
         if self.guided:
@@ -771,7 +780,7 @@ def run_episode(
 
 
 def _load_checkpoint(
-    path: str, device: jax.Device
+    path: str, device: jax.Device, env_config: dict | None = None
 ) -> tuple[dict, RunningMeanStd | None, int, bool, float]:
     """Read a JAX training checkpoint and place its arrays on `device`."""
     exc = None
@@ -797,6 +806,11 @@ def _load_checkpoint(
             f"'{path}' has no 'actor_params' entry — it is not a JAX checkpoint "
             "written by src.train_simple."
         )
+
+    if env_config is not None:
+        for flag in ('actor_bosco_guidance', 'bosco_reward_guidance'):
+            if flag in ckpt:
+                env_config[flag] = bool(ckpt[flag])
 
     params = jax.device_put(ckpt['actor_params'], device)
     rms = None
@@ -888,6 +902,12 @@ def main() -> None:
               "so the sweep can finish (override with --max-steps).")
         env_cfg = {**env_cfg, 'max_steps': _BOSCO_MIN_STEPS}
 
+    if args.policy == "mappo":
+        params, obs_rms, update, checkpoint_guided, checkpoint_guide_bonus = _load_checkpoint(
+            args.checkpoint, device, env_cfg
+        )
+        print(f"Loaded: {args.checkpoint}  (update {update})")
+
     env   = MultiRobotCoverageEnv(env_cfg)
     #walls = np.asarray(env.walls)
 
@@ -904,10 +924,6 @@ def main() -> None:
             hidden_size=model_cfg.get('hidden_size', 128),
         )
 
-        params, obs_rms, update, checkpoint_guided, checkpoint_guide_bonus = _load_checkpoint(
-            args.checkpoint, device
-        )
-        print(f"Loaded: {args.checkpoint}  (update {update})")
 
         if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
             obs_rms = None
