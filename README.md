@@ -235,3 +235,7 @@ python -m src.evaluate_policies \
 Visualization carries memory between frames and resets it for each new episode.
 Numeric evaluation carries memory between compiled chunks, resets environments
 independently, and does not construct or step a BOSCO planner for this actor.
+
+Resume a trained recurrent actor for a fixed fine-tuning phase with
+`--additional-updates`. The end-to-end revisit penalty is configured by
+`e2e_reward.beta` and is persisted in the resulting checkpoint.

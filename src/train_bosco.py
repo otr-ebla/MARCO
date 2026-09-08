@@ -470,7 +470,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
           num_envs: int | None = None, policy_mode: str = "guided",
-          num_maps: int | None = None):
+          num_maps: int | None = None,
+          additional_updates: int | None = None):
     if policy_mode not in ('guided', 'end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
@@ -595,7 +596,16 @@ def train(config_path: str, save_dir: str, resume: str | None,
         )
         carry = carry._replace(rms=rms)
         start_update = last + 1
+        if additional_updates is not None:
+            if additional_updates <= 0:
+                raise ValueError('additional_updates must be positive')
+            total_updates = last + additional_updates
         print(f"Resumed from {resume}, continuing at update {start_update}")
+        if additional_updates is not None:
+            print(f"Fine-tuning for {additional_updates} additional updates "
+                  f"(through update {total_updates})")
+    elif additional_updates is not None:
+        raise ValueError('additional_updates requires a resume checkpoint')
 
     run = init_wandb(
         config,
@@ -854,6 +864,8 @@ if __name__ == '__main__':
     parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 64 on GPU if config uses <=16)')
     parser.add_argument('--maps', type=int, default=None,
                         help='Procedural map-bank size for end-to-end modes')
+    parser.add_argument('--additional-updates', type=int, default=None,
+                        help='When resuming, run exactly this many extra updates')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -866,4 +878,5 @@ if __name__ == '__main__':
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
           }, num_humans=args.humans, num_envs=args.envs,
-          policy_mode=args.policy_mode, num_maps=args.maps)
+          policy_mode=args.policy_mode, num_maps=args.maps,
+          additional_updates=args.additional_updates)

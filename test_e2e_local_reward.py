@@ -37,7 +37,7 @@ class LocalRewardTest(unittest.TestCase):
         self.assertAlmostEqual(self.reward(self.state(2.1)), -.02, places=5)
 
     def test_revisit_is_charged_on_cell_entry(self):
-        self.assertAlmostEqual(self.reward(self.state(2.45, True)), -.27, places=5)
+        self.assertAlmostEqual(self.reward(self.state(2.45, True)), -2.02, places=5)
 
     def test_late_discovery_credit_grows_with_coverage(self):
         state = self.state(2.45)

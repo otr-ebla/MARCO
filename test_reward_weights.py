@@ -40,8 +40,10 @@ def test_end_to_end_reward_prioritises_late_discoveries_and_completion():
     assert config["e2e_num_maps"] == 64
     assert E2E_REWARD_DEFAULTS["coverage_reward_growth"] == 2.0
     assert E2E_REWARD_DEFAULTS["completion_bonus"] == 200.0
+    assert E2E_REWARD_DEFAULTS["beta"] == 2.0
     assert config["e2e_reward"]["coverage_reward_growth"] == 2.0
     assert config["e2e_reward"]["completion_bonus"] == 200.0
+    assert config["e2e_reward"]["beta"] == 2.0
 
 
 def test_redundancy_may_be_penalised_more_than_elapsed_time():

@@ -24,7 +24,7 @@ _BIG = 1.0e9
 E2E_REWARD_DEFAULTS = {
     'reward_mode': 'local_coverage_v1',
     'alpha': 10.0,
-    'beta': 0.25,  # per entry into a previously covered cell
+    'beta': 2.0,  # per entry into a previously covered cell
     'tau': 0.02,
     'wall_kappa': 2.0,
     'kappa': 5.0,

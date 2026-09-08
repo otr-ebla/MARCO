@@ -130,7 +130,7 @@ e2e_num_maps: 64
 e2e_reward:
   reward_mode: local_coverage_v1
   alpha: 10.0
-  beta: 0.25
+  beta: 2.0
   tau: 0.02
   wall_kappa: 2.0
   kappa: 5.0
