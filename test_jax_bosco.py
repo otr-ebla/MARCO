@@ -148,6 +148,52 @@ def test_entering_an_already_covered_target_does_not_pay_coverage_reward():
     assert coverage_reward.tolist() == [[False]]
 
 
+def test_controller_keeps_covered_target_until_geometric_arrival():
+    state = JaxGuideState(
+        target=jnp.asarray([[1]], dtype=jnp.int32),
+        prev_cell=jnp.asarray([[0]], dtype=jnp.int32),
+        fail_cov=jnp.asarray([[-1]], dtype=jnp.int32),
+        idx=jnp.asarray([[1]], dtype=jnp.int32),
+        tours=jnp.asarray([[[0, 1, 2]]], dtype=jnp.int32),
+        tour_lens=jnp.asarray([[3]], dtype=jnp.int32),
+    )
+    covered = jnp.asarray([[[1.0, 1.0, 0.0]]], dtype=jnp.float32)
+
+    waiting, waypoint, _ = jax_guide_step(
+        state,
+        positions=jnp.asarray([[[0.9, 0.5]]], dtype=jnp.float32),
+        coverage_grid=covered,
+        done=jnp.asarray([False]),
+        graph_neighbors=_line_neighbors(3),
+        w=3,
+        h=1,
+        cell_size=1.0,
+        free_cells=jnp.ones((3,), dtype=jnp.bool_),
+        graph_components=jnp.zeros((3,), dtype=jnp.int32),
+        target_arrived=jnp.asarray([[False]]),
+    )
+
+    assert waypoint.tolist() == [[1]]
+    assert waiting.idx.tolist() == [[1]]
+
+    advanced, waypoint, _ = jax_guide_step(
+        waiting,
+        positions=jnp.asarray([[[1.5, 0.5]]], dtype=jnp.float32),
+        coverage_grid=covered,
+        done=jnp.asarray([False]),
+        graph_neighbors=_line_neighbors(3),
+        w=3,
+        h=1,
+        cell_size=1.0,
+        free_cells=jnp.ones((3,), dtype=jnp.bool_),
+        graph_components=jnp.zeros((3,), dtype=jnp.int32),
+        target_arrived=jnp.asarray([[True]]),
+    )
+
+    assert waypoint.tolist() == [[2]]
+    assert advanced.idx.tolist() == [[2]]
+
+
 def test_mopup_ignores_closer_uncovered_cell_in_an_unreachable_component():
     tours = jnp.full((1, 1, 5), -1, dtype=jnp.int32).at[0, 0, 0].set(0)
     state = JaxGuideState(

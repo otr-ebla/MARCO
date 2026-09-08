@@ -76,6 +76,20 @@ humans by default:
 python -m src.evaluate_policies --episodes 1000 --output-dir evaluation_results
 ```
 
+For fast accelerator evaluation, run the BOSCO route follower through the
+vectorised JAX engine too. This keeps one environment per episode in the batch
+when `--batch-size` equals `--episodes`; tour construction is a one-time host
+setup and every simulation step runs inside the compiled scan:
+
+```bash
+python -m src.evaluate_policies --episodes 1000 --batch-size 1000 \
+  --chunk-steps 512 --backend cuda --bosco-mode jax \
+  --output-dir evaluation_results
+```
+
+Use `--bosco-mode host` (the default) when exact parity with the richer
+recovery/yielding controller in `test_visual` matters more than throughput.
+
 Change every dynamic-obstacle scenario with `--humans N`, for example
 `--humans 4`. This affects plain BOSCO with humans and both MARL evaluations,
 but does not change the additional zero-human BOSCO baseline or which training

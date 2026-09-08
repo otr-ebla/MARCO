@@ -2,5 +2,9 @@ __pycache__/
 *.py[cod]
 *.class
 
+# Runtime artifacts & logs
+wandb/
+checkpoints/
+
 # Cartella output esperimenti e benchmark
 evaluation_results/

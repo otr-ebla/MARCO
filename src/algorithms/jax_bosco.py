@@ -193,7 +193,7 @@ def advance_cursors(tours, tour_lens, idx, cell, covered, snap_window=8):
 def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
                    graph_neighbors, w, h, cell_size, guides=None,
                    free_cells=None, graph_components=None, revisit_penalty=0.5,
-                   previous_coverage_grid=None):
+                   previous_coverage_grid=None, target_arrived=None):
     """Advance the fixed sweep and emit a reactive one-cell waypoint.
 
     The remaining sweep is retained after a deviation, while its shortest-path
@@ -241,7 +241,14 @@ def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
     # waypoint stays stable until its cell has actually been covered; otherwise
     # a robot that only enters/approaches a cell can receive a new objective.
     reached = (~done[:, None]) & (cell == state.target) & target_newly_covered
-    can_advance = done[:, None] | ~valid_target | target_covered
+    # A guide used as an observation may advance as soon as its target cell is
+    # covered: the learned actor is free to cut the corner.  A guide used as the
+    # actual BOSCO controller must keep the target stable until the robot reaches
+    # the cell centre, otherwise the target flips while the robot is still on the
+    # preceding leg and successive 90-degree turns get cut into walls.
+    if target_arrived is None:
+        target_arrived = target_covered
+    can_advance = done[:, None] | ~valid_target | (target_covered & target_arrived)
     
     # Derive candidates in parallel, then retain the previous per-robot guide
     # state wherever ``can_advance`` is false.

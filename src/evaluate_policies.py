@@ -8,9 +8,10 @@ The default experiment evaluates 1,000 episodes for each of:
   * BOSCO-guided MARL trained with eight humans.
 
 Raw episode data, aggregate statistics and run metadata are written to the output
-directory. MARL environments run in compiled accelerator batches; plain BOSCO
-uses the same host-side expert controller as the visual test. Figures are generated
-separately by ``python -m src.plot_evaluation_results``.
+directory. MARL and the optional JAX BOSCO controller run in compiled accelerator
+batches. The reference host BOSCO remains available for exact comparisons with
+the visual controller. Figures are generated separately by
+``python -m src.plot_evaluation_results``.
 """
 
 from __future__ import annotations
@@ -276,11 +277,19 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             revisited = entered & (covered_before[env_ids, current_cell] > 0.5)
             next_guide = None
             if guided:
+                safe_target = jnp.maximum(guide_state.target, 0)
+                target_center = centers[safe_target]
+                target_arrived = ((guide_state.target >= 0)
+                                  & (jnp.linalg.norm(
+                                      next_state.robot_positions - target_center,
+                                      axis=-1,
+                                  ) < 0.06))
                 next_guide, waypoint, _ = jax_guide_step(
                     guide_state, next_state.robot_positions, next_state.coverage_grid, done,
                     neighbors, vec_env.grid_w, vec_env.grid_h, env.cell_size,
                     free_cells=free, graph_components=components,
                     previous_coverage_grid=state.coverage_grid,
+                    target_arrived=(target_arrived if spec.kind == "bosco" else None),
                 )
                 valid = waypoint >= 0
                 coords = centers[jnp.maximum(waypoint, 0)]
@@ -407,6 +416,20 @@ def evaluate_bosco(spec: PolicySpec, config_path: Path, episodes: int, seed: int
                   f"elapsed {elapsed / 60:.1f} min | ETA {eta / 60:.1f} min",
                   flush=True)
     return rows
+
+
+def evaluate_spec(spec: PolicySpec, args: argparse.Namespace, device) -> list[dict]:
+    """Evaluate one policy through the selected execution engine."""
+    if spec.kind == "bosco" and args.bosco_mode == "host":
+        return evaluate_bosco(
+            spec, args.config, args.episodes, args.seed, args.max_steps,
+            args.progress_every,
+        )
+    return evaluate_marl(
+        spec, args.config, args.episodes, args.seed, args.max_steps,
+        args.batch_size, args.chunk_steps, args.stochastic, device,
+        args.progress_every,
+    )
 
 
 def write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
@@ -559,6 +582,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of using tanh(policy mean)")
     parser.add_argument("--e2e-checkpoint", type=Path, default=None,
                         help="Add an end-to-end MARL policy to the comparison")
+    parser.add_argument("--bosco-mode", choices=("jax", "host"), default="host",
+                        help="BOSCO execution engine: GPU/CPU-vectorized JAX or "
+                             "the exact serial visual controller (default: host)")
     parser.add_argument("--skip-bosco", action="store_true")
     parser.add_argument("--skip-marl", action="store_true")
     parser.add_argument("--progress-every", type=int, default=10)
@@ -571,9 +597,10 @@ def main() -> None:
         raise SystemExit("episodes, batch-size and chunk-steps must be positive; humans cannot be negative")
     device = select_device(None if args.backend == "auto" else args.backend)
     print(f"Device: {describe(device)}")
+    bosco_label = "BOSCO JAX" if args.bosco_mode == "jax" else "Plain BOSCO"
     specs = [
-        PolicySpec("Plain BOSCO (0 humans)", "bosco", 0),
-        PolicySpec(f"Plain BOSCO ({args.humans} humans)", "bosco", args.humans),
+        PolicySpec(f"{bosco_label} (0 humans)", "bosco", 0),
+        PolicySpec(f"{bosco_label} ({args.humans} humans)", "bosco", args.humans),
         PolicySpec("BOSCO MARL (trained: 0 humans)", "marl", args.humans,
                    args.no_humans_checkpoint),
         PolicySpec("BOSCO MARL (trained: 8 humans)", "marl", args.humans,
@@ -592,17 +619,7 @@ def main() -> None:
     started = time.time()
     rows = []
     for spec in specs:
-        if spec.kind == "bosco":
-            rows.extend(evaluate_bosco(
-                spec, args.config, args.episodes, args.seed, args.max_steps,
-                args.progress_every,
-            ))
-        else:
-            rows.extend(evaluate_marl(
-                spec, args.config, args.episodes, args.seed, args.max_steps,
-                args.batch_size, args.chunk_steps, args.stochastic, device,
-                args.progress_every,
-            ))
+        rows.extend(evaluate_spec(spec, args, device))
     raw_path = args.output_dir / "episodes.csv"
     write_csv(raw_path, rows, FIELDS)
     summary = summarize(rows)
@@ -614,6 +631,7 @@ def main() -> None:
         "plain_bosco_evaluation_humans": [0, args.humans],
         "config": str(args.config.resolve()), "backend": describe(device),
         "stochastic": args.stochastic, "elapsed_seconds": time.time() - started,
+        "bosco_mode": args.bosco_mode,
         "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve()) if s.checkpoint else None} for s in specs],
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
