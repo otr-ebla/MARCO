@@ -39,11 +39,12 @@ class LocalRewardTest(unittest.TestCase):
     def test_revisit_is_charged_on_cell_entry(self):
         self.assertAlmostEqual(self.reward(self.state(2.45, True)), -.27, places=5)
 
-    def test_discovery_is_fixed_credit(self):
+    def test_late_discovery_credit_grows_with_coverage(self):
         state = self.state(2.45)
-        self.assertAlmostEqual(self.reward(state), 9.98, places=5)
+        early = self.reward(state)
         remote_coverage = state.coverage_grid.at[8:, :].set(1.)
-        self.assertAlmostEqual(self.reward(state.replace(coverage_grid=remote_coverage)), 9.98, places=5)
+        late = self.reward(state.replace(coverage_grid=remote_coverage))
+        self.assertGreater(late, early)
 
     def test_waiting_and_turning_cannot_earn_reward(self):
         state = self.state(2.1)

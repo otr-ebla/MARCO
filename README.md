@@ -197,14 +197,16 @@ Select `--policy-mode end-to-end-memory` to add a GRU (width `model.hidden_size`
 
 ```bash
 python -m src.train_bosco --policy-mode end-to-end-memory \
-  --save-dir checkpoints/e2e_memory_humans8 --humans 8 --envs 8 \
+  --save-dir checkpoints/e2e_memory_humans8 --humans 8 --envs 8 --maps 64 \
   --backend cuda --no-wandb
 ```
 
 Train from scratch: feed-forward checkpoints have incompatible actor parameters.
 The recurrent mode uses the same local inputs and `local_coverage_v1` reward as
-the feed-forward baseline. Each robot has independent memory, preserved between
-rollouts and reset on completion or timeout. PPO replays complete ordered
+the feed-forward baseline. End-to-end modes bypass BOSCO and sample independently
+from a procedural map bank (`e2e_num_maps`, or `--maps`). Each robot has
+independent memory, preserved between rollouts and reset on completion or timeout.
+PPO replays complete ordered
 rollouts and differentiates through the GRU over `train.rollout_steps` timesteps.
 Starting memory is detached for truncated backpropagation. The critic stays
 feed-forward and receives privileged global state during training.

@@ -11,13 +11,15 @@ class ProceduralMapLayout:
     computational complexity low. 
     """
     def __init__(self, width=12.0, height=8.0, min_room_size=2.0, max_walls=30,
-                 cell_size: float = 0.5, robot_radius: float = 0.20):
+                 cell_size: float = 0.5, robot_radius: float = 0.20,
+                 rng: random.Random | None = None):
         self.width = width
         self.height = height
         self.min_room_size = min_room_size
         self.max_walls = max_walls
         self.cell_size = cell_size
         self.robot_radius = robot_radius
+        self._rng = rng if rng is not None else random.Random()
         
         self.outer_t = 0.20
         self.inner_t = 0.08
@@ -50,7 +52,7 @@ class ProceduralMapLayout:
         elif h >= w * 1.2:
             split_horizontally = True
         else:
-            split_horizontally = random.choice([True, False])
+            split_horizontally = self._rng.choice([True, False])
 
         min_cells = int(round(self.min_room_size / self.cell_size))
 
@@ -81,7 +83,7 @@ class ProceduralMapLayout:
             if not valid_split_cells_y:
                 return
                 
-            split_cell_y = random.choice(valid_split_cells_y)
+            split_cell_y = self._rng.choice(valid_split_cells_y)
             split_y = y + split_cell_y * self.cell_size
             
             w_cells = int(round(w / self.cell_size))
@@ -95,7 +97,7 @@ class ProceduralMapLayout:
             if not valid_door_cells:
                 return
             
-            door_cell = random.choice(valid_door_cells)
+            door_cell = self._rng.choice(valid_door_cells)
             door_pos = x + door_cell * self.cell_size
             
             if door_pos > x:
@@ -134,7 +136,7 @@ class ProceduralMapLayout:
             if not valid_split_cells_x:
                 return
                 
-            split_cell_x = random.choice(valid_split_cells_x)
+            split_cell_x = self._rng.choice(valid_split_cells_x)
             split_x = x + split_cell_x * self.cell_size
             
             h_cells = int(round(h / self.cell_size))
@@ -148,7 +150,7 @@ class ProceduralMapLayout:
             if not valid_door_cells:
                 return
                 
-            door_cell = random.choice(valid_door_cells)
+            door_cell = self._rng.choice(valid_door_cells)
             door_pos = y + door_cell * self.cell_size
             
             if door_pos > y:
@@ -177,12 +179,13 @@ class ProceduralMapLayout:
         return np.array(self.walls, dtype=np.float32)
 
 
-def create_map_bank(num_maps=16, **kwargs):
+def create_map_bank(num_maps=16, seed=0, **kwargs):
     """
     Generates a bank of random maps to be cached by the JAX environment.
     Runs purely in Python during initialization to avoid JAX dynamic loop overhead.
     """
-    return [ProceduralMapLayout(**kwargs) for _ in range(num_maps)]
+    rng = random.Random(seed)
+    return [ProceduralMapLayout(rng=rng, **kwargs) for _ in range(num_maps)]
 
 
 def main():

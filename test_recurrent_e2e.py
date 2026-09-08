@@ -66,6 +66,34 @@ class RecurrentActorTest(unittest.TestCase):
 
 
 class RecurrentRolloutTest(unittest.TestCase):
+    def test_unguided_rollout_supports_multiple_maps(self):
+        from src.algorithms.mappo import MAPPO
+        from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
+        from src.envs.vec_env import VecEnv
+        from src.models.actor_critic import Critic
+        from src.train_bosco import GuidedRollout
+
+        env = VecEnv(8, {**E2E_REWARD_DEFAULTS, 'num_maps': 3, 'num_robots': 2,
+                         'max_steps': 3, 'n_rays': 8, 'actor_bosco_guidance': False,
+                         'bosco_reward_guidance': False})
+        actor = Actor(vec_dim=env.env.obs_vec_dim, n_rays=8,
+                      tail_dim=env.env.patch_dim, hidden_size=16,
+                      lidar_embed=8, recurrent=True)
+        mappo = MAPPO(actor, Critic(hidden_size=16, map_embed=8), env, {'n_epochs': 1})
+        actor_state, critic_state = mappo.create_train_states(jax.random.PRNGKey(10))
+        rollout = GuidedRollout(mappo, env, None, 0.)
+        carry = rollout.start(jax.random.PRNGKey(11))
+
+        self.assertGreater(len(np.unique(np.asarray(carry.env_state.map_id))), 1)
+        final, traj, _, hits = rollout.run(
+            actor_state.params, critic_state.params, carry, 4,
+            jax.random.PRNGKey(12),
+        )
+
+        self.assertEqual(traj.obs.shape[:3], (4, 8, 2))
+        np.testing.assert_array_equal(hits, 0.)
+        self.assertIsNone(final.guide_state)
+
     def test_ppo_replay_reproduces_rollout_likelihoods_across_resets(self):
         from src.algorithms.bosco_guide import make_guides
         from src.algorithms.mappo import MAPPO, _tanh_normal_log_prob

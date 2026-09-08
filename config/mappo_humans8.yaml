@@ -1,8 +1,9 @@
 env:
   num_robots: 3
-  # The current JAX BOSCO rollout shares one traversability graph across all
-  # vector environments. Keep one layout until per-map guide graphs are batched.
+  # Guided BOSCO uses this single layout. End-to-end modes override it with
+  # e2e_num_maps below and bypass the planner entirely.
   num_maps: 1
+  map_seed: 0            # deterministic procedural bank; change for held-out maps
   num_humans: 0          # no dynamic obstacles in this baseline
   k_teammates: 0         # how many closest teammates each robot observes
   m_humans: 1            # observation slots for humans (zero-padded when 0 humans)
@@ -119,3 +120,5 @@ wandb:
   # "online" needs `wandb login` once. Use "offline" to log to ./wandb and sync
   # later with `wandb sync`, or "disabled" to keep the calls as no-ops.
   mode: online
+
+e2e_num_maps: 64

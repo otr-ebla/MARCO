@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from src.algorithms.bosco_guide import BoscoGuide
+from src.envs.map_layouts import create_map_bank
 
 
 def _two_map_env():
@@ -42,3 +43,16 @@ def test_bosco_guide_rebuilds_partition_for_the_selected_map():
     # The full-height wall makes the cells to its right unreachable from the
     # spawn. They must remain unowned instead of inheriting map 0's partition.
     assert np.all(guide.owner.reshape(2, 3)[:, 1:] == -1)
+
+
+def test_procedural_map_bank_is_reproducible_and_seeded_locally():
+    first = create_map_bank(3, seed=17)
+    same = create_map_bank(3, seed=17)
+    different = create_map_bank(3, seed=18)
+
+    for actual, expected in zip(first, same):
+        np.testing.assert_array_equal(actual.get_walls(), expected.get_walls())
+    assert any(
+        not np.array_equal(a.get_walls(), b.get_walls())
+        for a, b in zip(first, different)
+    )

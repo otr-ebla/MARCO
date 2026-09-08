@@ -29,8 +29,8 @@ E2E_REWARD_DEFAULTS = {
     'wall_kappa': 2.0,
     'kappa': 5.0,
     'human_kappa': 10.0,
-    'completion_bonus': 50.0,
-    'coverage_reward_growth': 0.0,
+    'completion_bonus': 200.0,
+    'coverage_reward_growth': 2.0,
     'room_completion_bonus': 0.0,
     'psi': 0.0,
     'velocity_cost': 0.0,
@@ -158,6 +158,7 @@ class MultiRobotCoverageEnv:
         # -- Map Bank Precomputation --
         self.num_maps = int(cfg.get('num_maps', 16))
         layouts = create_map_bank(self.num_maps,
+                                   seed=int(cfg.get('map_seed', 0)),
                                    cell_size=self.cell_size,
                                    robot_radius=self.robot_radius)
         
@@ -609,7 +610,6 @@ class MultiRobotCoverageEnv:
                       + self.completion_bonus * complete)
 
         if self.reward_mode == 'local_coverage_v1':
-            discovery_multiplier = 1.0
             team_bonus = self.completion_bonus * complete
 
         dist     = jnp.sqrt(self._pairwise_sq_dist(new_pos))

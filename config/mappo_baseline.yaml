@@ -1,8 +1,9 @@
 env:
   num_robots: 3
-  # The current JAX BOSCO rollout shares one traversability graph across all
-  # vector environments. Keep one layout until per-map guide graphs are batched.
+  # Guided BOSCO uses this single layout. End-to-end modes override it with
+  # e2e_num_maps below and bypass the planner entirely.
   num_maps: 1
+  map_seed: 0            # deterministic procedural bank; change for held-out maps
   num_humans: 0          # no dynamic obstacles in this baseline
   k_teammates: 0         # how many closest teammates each robot observes
   m_humans: 1            # observation slots for humans (zero-padded when 0 humans)
@@ -120,7 +121,11 @@ wandb:
   # later with `wandb sync`, or "disabled" to keep the calls as no-ops.
   mode: online
 
-# Applied only by train_bosco --policy-mode end-to-end.
+# Procedural map bank used by both end-to-end policy modes. Each environment
+# samples a map independently at reset; guided BOSCO still uses env.num_maps.
+e2e_num_maps: 64
+
+# Applied only by train_bosco end-to-end policy modes.
 # beta is charged per covered-cell entry, not per moving timestep.
 e2e_reward:
   reward_mode: local_coverage_v1
@@ -130,8 +135,8 @@ e2e_reward:
   wall_kappa: 2.0
   kappa: 5.0
   human_kappa: 10.0
-  completion_bonus: 50.0
-  coverage_reward_growth: 0.0
+  completion_bonus: 200.0
+  coverage_reward_growth: 2.0
   room_completion_bonus: 0.0
   psi: 0.0
   velocity_cost: 0.0

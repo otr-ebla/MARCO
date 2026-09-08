@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from src.envs.coverage_vector_env import MultiRobotCoverageEnv
+from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS, MultiRobotCoverageEnv
 from src.utils.config_parser import load_config
 
 
@@ -32,6 +32,16 @@ def test_baseline_reward_weights_are_loaded_by_the_environment():
     assert env_config["angular_cost"] == 0.01
     assert env_config["action_smoothness_cost"] == 0.01
     assert "bosco_gamma" not in config["wandb"]
+
+
+def test_end_to_end_reward_prioritises_late_discoveries_and_completion():
+    config = load_config(CONFIG)
+
+    assert config["e2e_num_maps"] == 64
+    assert E2E_REWARD_DEFAULTS["coverage_reward_growth"] == 2.0
+    assert E2E_REWARD_DEFAULTS["completion_bonus"] == 200.0
+    assert config["e2e_reward"]["coverage_reward_growth"] == 2.0
+    assert config["e2e_reward"]["completion_bonus"] == 200.0
 
 
 def test_redundancy_may_be_penalised_more_than_elapsed_time():
@@ -108,9 +118,13 @@ def test_assigned_new_cell_reward_is_four_times_other_new_cell_reward():
         "beta": 0.0,
         "tau": 0.0,
         "bosco_gamma": 0.0,
+        "bosco_distance_penalty": 0.0,
         "room_completion_threshold": 2.0,
         "room_completion_bonus": 0.0,
         "completion_bonus": 0.0,
+        "velocity_cost": 0.0,
+        "angular_cost": 0.0,
+        "action_smoothness_cost": 0.0,
     })
     state = env.reset(jax.random.PRNGKey(0)).replace(
         robot_headings=jnp.zeros((1,), jnp.float32)
@@ -162,6 +176,38 @@ def test_new_cell_reward_increases_with_existing_coverage():
     )
 
     assert late_reward[0] > early_reward[0]
+
+
+def test_local_coverage_reward_applies_late_discovery_growth():
+    env = MultiRobotCoverageEnv({
+        **E2E_REWARD_DEFAULTS,
+        "num_robots": 1,
+        "num_maps": 1,
+        "actor_bosco_guidance": False,
+        "bosco_reward_guidance": False,
+        "alpha": 8.0,
+        "beta": 0.0,
+        "tau": 0.0,
+        "completion_bonus": 0.0,
+    })
+    state = env.reset(jax.random.PRNGKey(21)).replace(
+        robot_headings=jnp.zeros((1,), jnp.float32)
+    )
+    cols, rows = env._pos_to_cell(state.robot_positions)
+    action = jnp.asarray([[1.0, 0.0]], jnp.float32)
+
+    _, early_reward, _, _ = env.step(state, action)
+    free = env.free_masks[state.map_id] > 0
+    free_rank = jnp.cumsum(free.reshape(-1)).reshape(free.shape)
+    half_covered = (
+        free & (free_rank <= env.free_totals[state.map_id] // 2)
+    ).astype(jnp.float32)
+    half_covered = half_covered.at[rows[0], cols[0]].set(0.0)
+    _, late_reward, _, _ = env.step(
+        state.replace(coverage_grid=half_covered), action
+    )
+
+    assert late_reward[0] > early_reward[0] * 1.9
 
 
 def test_global_state_exposes_agent_cell_assignments():

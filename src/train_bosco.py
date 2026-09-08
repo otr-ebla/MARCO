@@ -4,8 +4,8 @@
 `--policy-mode guided` preserves target deltas in actor observations and BOSCO
 reward shaping. `--policy-mode end-to-end` removes those two input channels and
 all planner-dependent rewards, including assignment-weighted discoveries.
-BOSCO targets and assignments remain available only to the centralized critic.
-Both modes share the device-side rollout, PPO, local coverage inputs and config.
+Guided mode keeps its single-map BOSCO graph; end-to-end modes bypass the planner
+entirely and sample independently from a procedural map bank.
 
     python -m src.train_bosco --policy-mode end-to-end --save-dir checkpoints/e2e
 
@@ -264,12 +264,14 @@ class GuidedRollout:
         self.mappo = mappo
         self.env = vec_env
         self.guides = guides
-        self.graph = guides[0].graph
+        self.guided = guides is not None
         self.bonus = float(guide_bonus)
-        self.graph_neighbors = jnp.asarray(self.graph.neighbors, jnp.int32)
-        self.graph_free = jnp.asarray(self.graph.free, jnp.bool_)
-        self.graph_components = jnp.asarray(self.graph.component, jnp.int32)
-        self.graph_centers = jnp.asarray(self.graph.centers, jnp.float32)
+        if self.guided:
+            self.graph = guides[0].graph
+            self.graph_neighbors = jnp.asarray(self.graph.neighbors, jnp.int32)
+            self.graph_free = jnp.asarray(self.graph.free, jnp.bool_)
+            self.graph_components = jnp.asarray(self.graph.component, jnp.int32)
+            self.graph_centers = jnp.asarray(self.graph.centers, jnp.float32)
         e, n = vec_env.E, vec_env.num_robots
 
         @jax.jit
@@ -301,28 +303,36 @@ class GuidedRollout:
                 obs_n, action, z, log_prob, value, rms, next_memory = act(
                     actor_params, critic_params, rms, obs, gstate, k, memory
                 )
-                next_state, _, reward, term, done, info, _ = vec_env.step(state, action)
-                
-                new_guide_state, waypoint, reached = jax_guide_step(
-                    guide_state,
-                    next_state.robot_positions,
-                    next_state.coverage_grid,
-                    done,
-                    self.graph_neighbors,
-                    vec_env.grid_w,
-                    vec_env.grid_h,
-                    vec_env.env.cell_size,
-                    free_cells=self.graph_free,
-                    graph_components=self.graph_components,
-                    previous_coverage_grid=state.coverage_grid,
-                )
-                
-                valid = waypoint >= 0
-                safe_targets = jnp.maximum(waypoint, 0)
-                coords = self.graph_centers[safe_targets]
-                target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
-                
-                next_state, next_obs, next_gstate = vec_env.update_bosco(next_state, target_coords)
+                (next_state, next_obs, reward, term, done, info,
+                 next_gstate) = vec_env.step(state, action)
+
+                if self.guided:
+                    new_guide_state, waypoint, reached = jax_guide_step(
+                        guide_state,
+                        next_state.robot_positions,
+                        next_state.coverage_grid,
+                        done,
+                        self.graph_neighbors,
+                        vec_env.grid_w,
+                        vec_env.grid_h,
+                        vec_env.env.cell_size,
+                        free_cells=self.graph_free,
+                        graph_components=self.graph_components,
+                        previous_coverage_grid=state.coverage_grid,
+                    )
+
+                    valid = waypoint >= 0
+                    safe_targets = jnp.maximum(waypoint, 0)
+                    coords = self.graph_centers[safe_targets]
+                    target_coords = jnp.where(
+                        valid[..., None], coords, next_state.robot_positions
+                    )
+                    next_state, next_obs, next_gstate = vec_env.update_bosco(
+                        next_state, target_coords
+                    )
+                else:
+                    new_guide_state = None
+                    reached = jnp.zeros((e, n), jnp.bool_)
                 
                 if mappo.actor.recurrent:
                     next_memory = jnp.where(jnp.repeat(done, n)[:, None], 0., next_memory)
@@ -366,8 +376,19 @@ class GuidedRollout:
 
     def start(self, key: jax.Array) -> GuidedCarry:
         state, obs, gstate, _ = self.env.reset(key)
-        pos, hdg, cov = self._host(state)
         E, N = self.env.E, self.env.num_robots
+        memory = (
+            jnp.zeros((E * N, self.mappo.actor.hidden_size), jnp.float32)
+            if self.mappo.actor.recurrent else None
+        )
+        if not self.guided:
+            return GuidedCarry(
+                state, obs, gstate, rms_init(self.env.norm_dim), None,
+                _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
+                memory,
+            )
+
+        pos, hdg, cov = self._host(state)
         
         MAX_TOUR_LEN = 2048
         tours = np.full((E, N, MAX_TOUR_LEN), -1, dtype=np.int32)
@@ -417,8 +438,7 @@ class GuidedRollout:
         return GuidedCarry(
             state, obs, gstate, rms_init(self.env.norm_dim), guide_state,
             _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
-            (jnp.zeros((E * N, self.mappo.actor.hidden_size), jnp.float32)
-             if self.mappo.actor.recurrent else None),
+            memory,
         )
 
     def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
@@ -449,7 +469,8 @@ def policy_checkpoint_score(policy_mode, completion, coverage, contacts, reward)
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
-          num_envs: int | None = None, policy_mode: str = "guided"):
+          num_envs: int | None = None, policy_mode: str = "guided",
+          num_maps: int | None = None):
     if policy_mode not in ('guided', 'end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
@@ -461,6 +482,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
     env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
     if policy_mode != 'guided':
         guide_bonus = 0.0
+        env_cfg['num_maps'] = int(
+            num_maps if num_maps is not None
+            else config.get('e2e_num_maps', env_cfg.get('num_maps', 16))
+        )
         reward_weights = {**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})}
         unknown = set(reward_weights) - set(E2E_REWARD_DEFAULTS)
         if unknown:
@@ -487,7 +512,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
-    if env.num_maps != 1:
+    if policy_mode == 'guided' and env.num_maps != 1:
         raise ValueError(
             "BOSCO-guided training currently requires env.num_maps=1: the "
             "accelerator rollout shares one traversability graph across all "
@@ -507,8 +532,13 @@ def train(config_path: str, save_dir: str, resume: str | None,
           f"({env.obs_dim} env)  |  critic map: "
           f"{vec_env.critic_channels}x{vec_env.grid_h}x{vec_env.grid_w}"
           f" + {vec_env.critic_vec_dim}")
-    print(f"Coverable cells: {int(env.free_totals[0])} / {env.num_cells} "
-          f"({env.free_totals[0] / env.num_cells:.1%} of the grid)")
+    free_totals = np.asarray(env.free_totals)
+    if env.num_maps == 1:
+        print(f"Coverable cells: {int(free_totals[0])} / {env.num_cells} "
+              f"({free_totals[0] / env.num_cells:.1%} of the grid)")
+    else:
+        print(f"Map bank: {env.num_maps} layouts | coverable cells: "
+              f"{int(free_totals.min())}-{int(free_totals.max())} / {env.num_cells}")
     print(f"Policy: {policy_mode}; BOSCO arrival bonus {guide_bonus} "
           f"(discovery alpha={env.alpha}, coverage growth="
           f"{env.coverage_reward_growth})")
@@ -546,9 +576,12 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     actor_state, critic_state = mappo.create_train_states(init_key)
 
-    guides = make_guides(env, E)
-    print(f"Map: {env.grid_h}x{env.grid_w} cells, "
-          f"{int(guides[0]._isolated.sum())} unreachable by the robot disc")
+    guides = make_guides(env, E) if policy_mode == 'guided' else None
+    if guides is not None:
+        print(f"Map: {env.grid_h}x{env.grid_w} cells, "
+              f"{int(guides[0]._isolated.sum())} unreachable by the robot disc")
+    else:
+        print(f"Maps: {env.grid_h}x{env.grid_w} cells, sampled independently on reset")
     rollout = GuidedRollout(mappo, vec_env, guides, guide_bonus)
     carry = rollout.start(reset_key)
 
@@ -819,6 +852,8 @@ if __name__ == '__main__':
                         help='W&B mode; "offline" logs locally with no network')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 64 on GPU if config uses <=16)')
+    parser.add_argument('--maps', type=int, default=None,
+                        help='Procedural map-bank size for end-to-end modes')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -830,4 +865,5 @@ if __name__ == '__main__':
               'name':    args.wandb_name,
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
-          }, num_humans=args.humans, num_envs=args.envs, policy_mode=args.policy_mode)
+          }, num_humans=args.humans, num_envs=args.envs,
+          policy_mode=args.policy_mode, num_maps=args.maps)
