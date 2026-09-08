@@ -167,6 +167,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
         assert spec.checkpoint is not None
         with spec.checkpoint.open("rb") as handle:
             checkpoint = pickle.load(handle)
+    recurrent = checkpoint.get("actor_recurrent", False)
     guided = checkpoint.get("actor_bosco_guidance", True)
     env_cfg["actor_bosco_guidance"] = guided
     env_cfg["bosco_reward_guidance"] = checkpoint.get("bosco_reward_guidance", True)
@@ -175,7 +176,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     env = vec_env.env
     if spec.kind == "marl":
         model_cfg = config.get("model", {})
-        actor = Actor(action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
+        actor = Actor(recurrent=recurrent, action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
                       n_rays=env.n_rays, tail_dim=env.patch_dim,
                       lidar_embed=model_cfg.get("lidar_embed", 64),
                       hidden_size=model_cfg.get("hidden_size", 128))
@@ -194,12 +195,18 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
         guide_state = None
 
 
+    memory = jnp.zeros((vec_env.E * env.num_robots, actor.hidden_size)) if recurrent else None
+
     def run_chunk(carry, keys):
         def one(c, action_key):
-            state, obs, guide_state = c
+            state, obs, guide_state, memory = c
             if spec.kind == "marl":
                 normalized = rms_normalize(rms, obs)
-                mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
+                if recurrent:
+                    mean, log_std, memory = actor.apply(
+                        params, normalized.reshape(-1, env.obs_dim), memory)
+                else:
+                    mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
                 if stochastic:
                     z = mean + jnp.exp(log_std) * jax.random.normal(action_key, mean.shape)
                     actions = jnp.tanh(z)
@@ -284,7 +291,9 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                       info["wall_collision_rate"], info["robot_collision_rate"],
                       info["human_collision_rate"], jnp.sum(revisited, axis=-1),
                       jnp.sum(entered, axis=-1))
-            return (next_state, next_obs, next_guide), output
+            if recurrent:
+                memory = jnp.where(jnp.repeat(done, env.num_robots)[:, None], 0., memory)
+            return (next_state, next_obs, next_guide, memory), output
         return jax.lax.scan(one, carry, keys)
 
     run_chunk = jax.jit(run_chunk)
@@ -297,7 +306,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     while len(rows) < episodes:
         key, chunk_key = jax.random.split(key)
         keys = jax.random.split(chunk_key, chunk_steps)
-        (state, obs, guide_state), outputs = run_chunk((state, obs, guide_state), keys)
+        (state, obs, guide_state, memory), outputs = run_chunk((state, obs, guide_state, memory), keys)
         arrays = [np.asarray(x) for x in jax.device_get(outputs)]
         (rewards, dones, terms, coverage, covered, complete, timeout, walls,
          robots, humans, revisits, entries) = arrays

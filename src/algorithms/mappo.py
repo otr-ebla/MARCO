@@ -120,6 +120,7 @@ class Transition(NamedTuple):
     human_hit: jax.Array  # fraction of the team that hit a human this step
     complete:  jax.Array  # 1.0 when the map was fully covered on this step
     timeout:   jax.Array  # 1.0 when the step hit the truncation horizon
+    memory:    object = None  # pre-observation GRU state (E*N, H), recurrent only
 
 
 class RolloutCarry(NamedTuple):
@@ -129,6 +130,25 @@ class RolloutCarry(NamedTuple):
     obs:       jax.Array
     gstate:    object      # GlobalState pytree
     rms:       RunningMeanStd
+
+
+def recurrent_actor_sequence(actor, params, obs, initial_memory, done):
+    """Replay ordered (T,E,N,D) inputs; reset each environment after done.
+
+    Gradients span one rollout, with the starting memory treated as constant.
+    """
+    t, e, n, d = obs.shape
+    def step(memory, inputs):
+        observation, ended = inputs
+        mean, log_std, memory = actor.apply(params, observation, memory)
+        reset = jnp.repeat(ended, n)[:, None]
+        memory = jnp.where(reset, 0., memory)
+        return memory, (mean, log_std)
+    memory, (mean, log_std) = jax.lax.scan(
+        step, jax.lax.stop_gradient(initial_memory),
+        (obs.reshape(t, e*n, d), done.astype(jnp.bool_)),
+    )
+    return memory, (mean.reshape(t*e*n, -1), log_std.reshape(t*e*n, -1))
 
 
 def _tanh_normal_log_prob(
@@ -165,13 +185,18 @@ def compute_gae(
     and value streams. Averaging rewards across agents here would undo the
     difference reward the environment computes.
 
-    Masking uses `term` only: a hard termination (collision or completed map)
-    stops the bootstrap, whereas truncation keeps it because V(s_timeout) is
-    meaningful. Termination is a team event, so the mask broadcasts over agents.
+    Feed-forward training masks only hard termination and bootstraps at a time
+    limit. Recurrent training also masks time limits because the environment and
+    actor memory both reset there; propagating an advantage across that boundary
+    would connect two unrelated episodes. The team mask broadcasts over agents.
     """
     values = jnp.concatenate([traj.value, last_value[None]], axis=0)   # (T+1, E, N)
     reward = traj.reward                                              # (T, E, N)
-    mask = (1.0 - traj.term.astype(jnp.float32))[:, :, None]          # (T, E, 1)
+    # Recurrent coverage treats the configured episode budget as a finite
+    # horizon. Never bootstrap from an auto-reset episode's value or carry its
+    # advantages backward across a memory reset. Preserve legacy FF semantics.
+    ended = traj.done if traj.memory is not None else traj.term
+    mask = (1.0 - ended.astype(jnp.float32))[:, :, None]              # (T, E, 1)
 
     def body(gae, xs):
         reward, value, next_value, m = xs
@@ -392,8 +417,9 @@ class MAPPO:
         t, e, n = traj.obs.shape[0], traj.obs.shape[1], traj.obs.shape[2]
         flat = t * e * n
 
-        # Every (t, e, i) triple is an independent sample: the actor is
-        # feed-forward, so there is no sequence to keep together.
+        # Feed-forward actors consume this flat batch directly. Recurrent
+        # actors use the original ordered trajectory below and flatten only
+        # their outputs so PPO ratios stay aligned with these action arrays.
         obs_f = traj.obs.reshape(flat, -1)
         act_f = traj.action.reshape(flat, -1)
         # The pre-squash sample is replayed from the rollout instead of being
@@ -417,7 +443,11 @@ class MAPPO:
         returns_f = returns.reshape(flat)
 
         def actor_loss_fn(params):
-            mean, log_std = self.actor.apply(params, obs_f)
+            if self.actor.recurrent:
+                _, (mean, log_std) = recurrent_actor_sequence(
+                    self.actor, params, traj.obs, traj.memory[0], traj.done)
+            else:
+                mean, log_std = self.actor.apply(params, obs_f)
             std = jnp.exp(log_std)
             log_prob = _tanh_normal_log_prob(z_f, mean, std, act_f)
 

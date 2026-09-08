@@ -1,4 +1,5 @@
 import unittest
+import random
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +11,7 @@ from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS, MultiRobotCoverage
 class LocalRewardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        random.seed(0)
         cls.env = MultiRobotCoverageEnv({
             **E2E_REWARD_DEFAULTS, 'num_maps': 1, 'num_robots': 1,
             'actor_bosco_guidance': False, 'bosco_reward_guidance': False,

@@ -188,3 +188,48 @@ numeric and visual evaluation. Old checkpoints without a version retain legacy
 reward semantics. Guided BOSCO training retains its original reward. For a clean
 experiment, train the new reward from scratch in a separate output directory;
 resuming transfers a critic and optimizer trained on the old objective.
+
+### End-to-end actor with memory
+
+Select `--policy-mode end-to-end-memory` to add a GRU (width `model.hidden_size`,
+128 by default) after the local observation encoder. The feed-forward
+`end-to-end` mode and the guided mode remain available separately.
+
+```bash
+python -m src.train_bosco --policy-mode end-to-end-memory \
+  --save-dir checkpoints/e2e_memory_humans8 --humans 8 --envs 8 \
+  --backend cuda --no-wandb
+```
+
+Train from scratch: feed-forward checkpoints have incompatible actor parameters.
+The recurrent mode uses the same local inputs and `local_coverage_v1` reward as
+the feed-forward baseline. Each robot has independent memory, preserved between
+rollouts and reset on completion or timeout. PPO replays complete ordered
+rollouts and differentiates through the GRU over `train.rollout_steps` timesteps.
+Starting memory is detached for truncated backpropagation. The critic stays
+feed-forward and receives privileged global state during training.
+
+The recurrent mode treats the episode step budget as a terminal horizon for GAE,
+preventing bootstrapping or advantage propagation across an environment reset.
+Legacy feed-forward GAE behavior is preserved. Memory therefore is not the only
+implementation difference when comparing against historical feed-forward runs.
+A resumed checkpoint restarts environments and memory; it does not restore a
+mid-episode simulator state. Recurrent rollout training consumes additional
+memory; the local CPU smoke tests do not establish CUDA throughput or convergence.
+
+Outputs: `checkpoint_e2e_memory.pkl` (best),
+`checkpoint_e2e_memory_latest.pkl` (end of training), and
+`training_log_e2e_memory.csv`. Both evaluators detect recurrent checkpoints:
+
+```bash
+python -m src.test_visual \
+  --checkpoint checkpoints/e2e_memory_humans8/checkpoint_e2e_memory.pkl \
+  --humans 8 --backend cpu
+
+python -m src.evaluate_policies \
+  --e2e-checkpoint checkpoints/e2e_memory_humans8/checkpoint_e2e_memory.pkl
+```
+
+Visualization carries memory between frames and resets it for each new episode.
+Numeric evaluation carries memory between compiled chunks, resets environments
+independently, and does not construct or step a BOSCO planner for this actor.

@@ -9,7 +9,11 @@ Both modes share the device-side rollout, PPO, local coverage inputs and config.
 
     python -m src.train_bosco --policy-mode end-to-end --save-dir checkpoints/e2e
 
-Train comparison policies from scratch; actor input widths differ between modes.
+`--policy-mode end-to-end-memory` adds a GRU to the local actor with the same
+observation width and reward as end-to-end. Memory resets at episode boundaries;
+PPO backpropagates ordered sequences over each rollout.
+
+Train comparison policies from scratch; actor architectures differ between modes.
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         'guide_dim':     int(guide_dim),
         'bosco_guided':  policy_mode == 'guided',
         'policy_mode': policy_mode,
+        'actor_recurrent': policy_mode == 'end-to-end-memory',
         'actor_bosco_guidance': policy_mode == 'guided',
         'bosco_reward_guidance': policy_mode == 'guided',
         'guide_bonus':   float(guide_bonus),
@@ -107,15 +112,15 @@ def _tree_shapes_match(a, b) -> bool:
 
 
 def load_checkpoint(path: str, actor_state, critic_state, device,
-                    trunk_in: int) -> tuple[object, object, RunningMeanStd, int]:
+                    _trunk_in: int) -> tuple[object, object, RunningMeanStd, int]:
     with open(path, 'rb') as f:
         ckpt = pickle.load(f)
 
     params = ckpt['actor_params']
-    if _trunk_key(params, trunk_in) is None:
+    if not _tree_shapes_match(actor_state.params, params):
         raise SystemExit(
-            f"'{path}' has no actor trunk taking {trunk_in} inputs — it was trained with a different "
-            "model config."
+            f"'{path}' has an incompatible actor architecture. Use a checkpoint "
+            "from the same policy mode and model configuration, or train from scratch."
         )
 
     params = jax.device_put(params, device)
@@ -153,6 +158,7 @@ class GuidedCarry(NamedTuple):
     episode_stats: object
     smoothed_col_rate: jax.Array
     smoothed_coverage_rate: jax.Array
+    memory: object = None
 
 
 class DeviceEpisodeStats(NamedTuple):
@@ -267,18 +273,22 @@ class GuidedRollout:
         e, n = vec_env.E, vec_env.num_robots
 
         @jax.jit
-        def act(actor_params, critic_params, rms, obs, gstate, key):
+        def act(actor_params, critic_params, rms, obs, gstate, key, memory):
             rms = rms_update(rms, obs.reshape(e * n, -1))
             obs_n = rms_normalize(rms, obs)
 
-            mean, log_std = mappo.actor.apply(actor_params, obs_n.reshape(e * n, -1))
+            if mappo.actor.recurrent:
+                mean, log_std, memory = mappo.actor.apply(
+                    actor_params, obs_n.reshape(e * n, -1), memory)
+            else:
+                mean, log_std = mappo.actor.apply(actor_params, obs_n.reshape(e * n, -1))
             std = jnp.exp(log_std)
             z = mean + std * jax.random.normal(key, mean.shape)
             action = jnp.tanh(z)
             log_prob = _tanh_normal_log_prob(z, mean, std, action).reshape(e, n)
             value = mappo._values(critic_params, gstate)
             return (obs_n, action.reshape(e, n, -1), z.reshape(e, n, -1),
-                    log_prob, value, rms)
+                    log_prob, value, rms, memory)
 
         self._act = act
         self._value_fn = jax.jit(mappo._values)
@@ -286,10 +296,10 @@ class GuidedRollout:
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
                 (state, obs, gstate, rms, guide_state, episode_stats,
-                 smoothed_col_rate, smoothed_coverage_rate) = c
+                 smoothed_col_rate, smoothed_coverage_rate, memory) = c
                 
-                obs_n, action, z, log_prob, value, rms = act(
-                    actor_params, critic_params, rms, obs, gstate, k
+                obs_n, action, z, log_prob, value, rms, next_memory = act(
+                    actor_params, critic_params, rms, obs, gstate, k, memory
                 )
                 next_state, _, reward, term, done, info, _ = vec_env.step(state, action)
                 
@@ -314,7 +324,10 @@ class GuidedRollout:
                 
                 next_state, next_obs, next_gstate = vec_env.update_bosco(next_state, target_coords)
                 
+                if mappo.actor.recurrent:
+                    next_memory = jnp.where(jnp.repeat(done, n)[:, None], 0., next_memory)
                 trans = Transition(
+                    memory=memory,
                     obs=obs_n,
                     gstate=gstate,
                     action=action,
@@ -338,7 +351,7 @@ class GuidedRollout:
                 
                 next_carry = GuidedCarry(
                     next_state, next_obs, next_gstate, rms, new_guide_state,
-                    episode_stats, smoothed_col_rate, smoothed_coverage_rate,
+                    episode_stats, smoothed_col_rate, smoothed_coverage_rate, next_memory,
                 )
                 return next_carry, (trans, reached)
                 
@@ -404,6 +417,8 @@ class GuidedRollout:
         return GuidedCarry(
             state, obs, gstate, rms_init(self.env.norm_dim), guide_state,
             _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
+            (jnp.zeros((E * N, self.mappo.actor.hidden_size), jnp.float32)
+             if self.mappo.actor.recurrent else None),
         )
 
     def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
@@ -413,7 +428,6 @@ class GuidedRollout:
         return final_carry, traj, last_value, hits
 
 # ---------------------------------------------------------------------------
-# Training loop----------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -427,7 +441,7 @@ LOG_NAME        = 'training_log_bosco.csv'
 
 def policy_checkpoint_score(policy_mode, completion, coverage, contacts, reward):
     """Rank completed-episode metrics for checkpoint selection."""
-    if policy_mode == "end-to-end":
+    if policy_mode in ("end-to-end", "end-to-end-memory"):
         return (completion, coverage, -contacts, reward)
     return (completion, -contacts, coverage, reward)
 
@@ -436,7 +450,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
           num_envs: int | None = None, policy_mode: str = "guided"):
-    if policy_mode not in ('guided', 'end-to-end'):
+    if policy_mode not in ('guided', 'end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
     device = select_device(backend)
@@ -445,7 +459,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     env_cfg = config.setdefault('env', {})
     env_cfg['actor_bosco_guidance'] = policy_mode == 'guided'
     env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
-    if policy_mode == 'end-to-end':
+    if policy_mode != 'guided':
         guide_bonus = 0.0
         reward_weights = {**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})}
         unknown = set(reward_weights) - set(E2E_REWARD_DEFAULTS)
@@ -459,6 +473,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
     checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
     latest_name = LATEST_CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e_latest.pkl'
     log_name = LOG_NAME if policy_mode == 'guided' else 'training_log_e2e.csv'
+    if policy_mode == 'end-to-end-memory':
+        checkpoint_name = 'checkpoint_e2e_memory.pkl'
+        latest_name = 'checkpoint_e2e_memory_latest.pkl'
+        log_name = 'training_log_e2e_memory.csv'
     if num_humans > 0:
         env_cfg['num_humans'] = num_humans
     model_cfg = config.get('model', {})
@@ -498,6 +516,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     print(f"Reward mode: {env.reward_mode}; weights: wall_kappa={env.wall_kappa:g}, beta={env.beta:g}")
 
     actor = Actor(
+        recurrent=policy_mode == "end-to-end-memory",
         action_dim=action_dim,
         vec_dim=env.obs_vec_dim,
         n_rays=env.n_rays,
@@ -766,9 +785,10 @@ if __name__ == '__main__':
     _default_save = os.path.join(os.path.dirname(__file__), '..', 'checkpoints')
 
     parser = argparse.ArgumentParser(
-        description='Train MAPPO for indoor coverage under BOSCO waypoint guidance')
-    parser.add_argument('--policy-mode', choices=['guided', 'end-to-end'],
-                        default='guided', help='Actor guidance and reward regime; critic retains BOSCO state')
+        description='Train guided, feed-forward end-to-end, or recurrent MAPPO')
+    parser.add_argument('--policy-mode', choices=['guided', 'end-to-end', 'end-to-end-memory'],
+                        default='guided', help='Policy architecture and guidance regime; '
+                             'end-to-end-memory uses a GRU actor')
     parser.add_argument('--config',   default=_default_cfg,
                         help='Path to YAML config file')
     parser.add_argument('--save-dir', default=_default_save,

@@ -59,7 +59,7 @@ def _conv(features: int, kernel, strides, padding, gain: float = _RELU_GAIN) -> 
 
 class Actor(nn.Module):
     """
-    Shared-parameter feed-forward actor used by all N robots.
+    Shared-parameter actor, optionally with a per-robot GRU memory.
 
     The observation layout is fixed by the environment:
         [continuous vector (vec_dim) | lidar (n_rays)]
@@ -74,13 +74,15 @@ class Actor(nn.Module):
     tail_dim: int = 0
     lidar_embed: int = 64
     hidden_size: int = 128
+    recurrent: bool = False
 
     @nn.compact
-    def __call__(self, obs: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, obs: jax.Array, memory=None):
         """
         obs : (B, obs_dim)
         ->  mean    (B, action_dim)  — unbounded, used as mu of underlying Gaussian
-            log_std (action_dim,)
+            log_std (action_dim,) for feed-forward, (B, action_dim) for recurrent
+            memory  (B, hidden_size), recurrent only
         """
         vec   = obs[:, : self.vec_dim]
         lidar = obs[:, self.vec_dim : self.vec_dim + self.n_rays]
@@ -97,6 +99,11 @@ class Actor(nn.Module):
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
 
+        if self.recurrent:
+            if memory is None:
+                memory = jnp.zeros((obs.shape[0], self.hidden_size), obs.dtype)
+            memory, h = nn.GRUCell(features=self.hidden_size, name='memory')(memory, h)
+
         mean = _dense(self.action_dim, 0.01)(h)
 
         # State-independent spread: the MLP predicts only the mean, so no
@@ -108,6 +115,8 @@ class Actor(nn.Module):
             (self.action_dim,),
         )
         log_std = _LOG_STD_MIN + (_LOG_STD_MAX - _LOG_STD_MIN) * nn.sigmoid(raw)
+        if self.recurrent:
+            return mean, jnp.broadcast_to(log_std, mean.shape), memory
         return mean, log_std
 
 

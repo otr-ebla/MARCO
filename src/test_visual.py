@@ -437,6 +437,9 @@ class MappoController:
                  obs_rms: RunningMeanStd | None, guided: bool = False,
                  guide_bonus: float = 2.0):
         self.env, self.params, self.obs_rms = env, params, obs_rms
+        self.recurrent = actor.recurrent
+        self.memory_size = actor.hidden_size
+        self.memory = None
         self.guided = guided
         self.guide_bonus = float(guide_bonus)
         self.expert = (BoscoGuide(env) if guided else
@@ -455,9 +458,12 @@ class MappoController:
         @jax.jit
         def policy_step(params, rms, state, obs, guide_state,
                         graph_neighbors, graph_free, graph_components,
-                        graph_centers):
+                        graph_centers, memory):
             obs_n = rms_normalize(rms, obs) if rms is not None else obs
-            mean, _ = actor.apply(params, obs_n)
+            if actor.recurrent:
+                mean, _, memory = actor.apply(params, obs_n, memory)
+            else:
+                mean, _ = actor.apply(params, obs_n)
             action = jnp.tanh(mean)                   # deterministic
             next_state, rewards, terminated, truncated = env.step(state, action)
 
@@ -486,11 +492,13 @@ class MappoController:
                 rewards = rewards + self.guide_bonus * reached[0].astype(jnp.float32)
 
             return (next_state, env.get_obs(next_state), guide_state,
-                    rewards, terminated, truncated)
+                    rewards, terminated, truncated, memory)
 
         self._fn = policy_step
 
     def reset(self, state):
+        self.memory = (jnp.zeros((self.env.num_robots, self.memory_size), jnp.float32)
+                       if self.recurrent else None)
         if self.expert is None:
             self.owner = np.full((self.env.grid_h, self.env.grid_w),
                                  self.env.num_robots, dtype=np.int32)
@@ -555,10 +563,10 @@ class MappoController:
         return state
 
     def step(self, state, snap: dict):
-        state, self.obs, self.guide_state, rewards, terminated, truncated = self._fn(
+        state, self.obs, self.guide_state, rewards, terminated, truncated, self.memory = self._fn(
             self.params, self.obs_rms, state, self.obs, self.guide_state,
             self.graph_neighbors, self.graph_free, self.graph_components,
-            self.graph_centers,
+            self.graph_centers, self.memory,
         )
         return state, rewards, terminated, truncated
 
@@ -809,6 +817,7 @@ def _load_checkpoint(
 
     if env_config is not None:
         env_config.update(ckpt.get("reward_weights", {}))
+        env_config["actor_recurrent"] = bool(ckpt.get("actor_recurrent", False))
         for flag in ('actor_bosco_guidance', 'bosco_reward_guidance'):
             if flag in ckpt:
                 env_config[flag] = bool(ckpt[flag])
@@ -917,6 +926,7 @@ def main() -> None:
         print(f"Controller: BOSCO (deterministic, {env.num_robots} robots)")
     else:
         actor = Actor(
+            recurrent=env_cfg.get("actor_recurrent", False),
             action_dim=env.action_dim,
             vec_dim=env.obs_vec_dim,
             n_rays=env.n_rays,
