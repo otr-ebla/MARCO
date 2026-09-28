@@ -277,21 +277,15 @@ class MAPPO:
         """Initialise parameters (on CPU when the backend lacks QR) and optimisers."""
         actor_key, critic_key = jax.random.split(key)
 
-        env = self.env
-        dummy_obs  = jnp.zeros((1, env.obs_dim), jnp.float32)
-        dummy_grid = jnp.zeros(
-            (1, env.critic_channels, env.grid_h, env.grid_w), jnp.float32
-        )
-        dummy_vec  = jnp.zeros((1, env.critic_vec_dim), jnp.float32)
+        dummy_obs = jnp.zeros((1, self.env.obs_dim), jnp.float32)
 
         with jax.default_device(self.init_device):
-            args = jax.device_put(
-                (actor_key, critic_key, dummy_obs, dummy_grid, dummy_vec),
+            a_key, c_key, o, c_args = jax.device_put(
+                (actor_key, critic_key, dummy_obs, self._dummy_critic_args()),
                 self.init_device,
             )
-            a_key, c_key, o, g, v = args
             actor_params = self.actor.init(a_key, o)
-            critic_params = self.critic.init(c_key, g, v)
+            critic_params = self.critic.init(c_key, *c_args)
 
         actor_params = jax.device_put(actor_params, self.device)
         critic_params = jax.device_put(critic_params, self.device)
@@ -316,16 +310,28 @@ class MAPPO:
         # Statistics cover only the continuous prefix of the observation.
         return RolloutCarry(env_state, obs, gstate, rms_init(self.env.norm_dim))
 
-    def _values(self, critic_params, gstate) -> jax.Array:
-        """V_i(s) for every agent slot. gstate has leading (E,) -> (E, N)."""
-        e, n = self.env.E, self.env.num_robots
-        grid, vec = self.env.critic_inputs(gstate)
-        value = self.critic.apply(
-            critic_params,
-            grid.reshape(e * n, *grid.shape[-3:]),
-            vec.reshape(e * n, -1),
+    # The critic's input is the only difference between MAPPO and IPPO; the
+    # two hooks below are what a subclass overrides.
+
+    def _dummy_critic_args(self) -> tuple:
+        env = self.env
+        return (
+            jnp.zeros((1, env.critic_channels, env.grid_h, env.grid_w), jnp.float32),
+            jnp.zeros((1, env.critic_vec_dim), jnp.float32),
         )
-        return value.reshape(e, n)
+
+    def _critic_args(self, obs_n: jax.Array, gstate) -> tuple:
+        """Flat critic inputs for obs_n : (..., N, obs_dim) and matching gstate.
+
+        MAPPO: the agent-centred global state V_i(s); obs_n is unused.
+        """
+        grid, vec = self.env.critic_inputs(gstate)
+        return (grid.reshape(-1, *grid.shape[-3:]), vec.reshape(-1, vec.shape[-1]))
+
+    def _values(self, critic_params, obs_n: jax.Array, gstate) -> jax.Array:
+        """Value of every agent slot, shaped like obs_n without its last axis."""
+        value = self.critic.apply(critic_params, *self._critic_args(obs_n, gstate))
+        return value.reshape(obs_n.shape[:-1])
 
     # ------------------------------------------------------------------
     # Rollout collection (single device call for T steps)
@@ -365,7 +371,7 @@ class MAPPO:
             action = action.reshape(e, n, -1)
             z = z.reshape(e, n, -1)
 
-            value = self._values(critic_params, carry.gstate)
+            value = self._values(critic_params, obs_n, carry.gstate)
 
             env_state, next_obs, reward, term, done, info, next_gstate = self.env.step(
                 carry.env_state, action
@@ -397,7 +403,9 @@ class MAPPO:
             return RolloutCarry(env_state, next_obs, next_gstate, rms), transition
 
         carry, traj = jax.lax.scan(step, carry, jax.random.split(key, num_steps))
-        last_value = self._values(critic_params, carry.gstate)
+        last_value = self._values(
+            critic_params, rms_normalize(carry.rms, carry.obs), carry.gstate
+        )
         return carry, traj, last_value
 
     # ------------------------------------------------------------------
@@ -437,9 +445,7 @@ class MAPPO:
 
         # Expanded once here rather than inside the epoch scan: the per-agent
         # channel stack is the largest tensor in the update.
-        grid, vec = self.env.critic_inputs(traj.gstate)
-        grid_f = grid.reshape(flat, *grid.shape[-3:])
-        vec_f = vec.reshape(flat, -1)
+        critic_args = self._critic_args(traj.obs, traj.gstate)
         returns_f = returns.reshape(flat)
 
         def actor_loss_fn(params):
@@ -464,7 +470,7 @@ class MAPPO:
             return loss - self.entropy_coef * entropy, (loss, entropy, jnp.mean(std))
 
         def critic_loss_fn(params):
-            values = self.critic.apply(params, grid_f, vec_f).squeeze(-1)
+            values = self.critic.apply(params, *critic_args).squeeze(-1)
             # Huber rather than MSE: the completion bonuses are sparse and large,
             # so a single unpredicted bonus produces an error the squared loss
             # amplifies into a gradient that wipes out the value head. Huber is

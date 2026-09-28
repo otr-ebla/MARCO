@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark BOSCO and BOSCO-guided MARL policies and save result data.
+"""Benchmark trained MARL coverage policies and save result data.
 
-The default experiment evaluates 1,000 episodes for each of:
-  * the learning-free BOSCO route controller without humans,
-  * the learning-free BOSCO route controller with eight humans,
-  * BOSCO-guided MARL trained without humans, and
-  * BOSCO-guided MARL trained with eight humans.
+    python -m src.evaluate_policies --checkpoint checkpoints/e2e/checkpoint_e2e.pkl
 
-Raw episode data, aggregate statistics and run metadata are written to the output
-directory. MARL and the optional JAX BOSCO controller run in compiled accelerator
-batches. The reference host BOSCO remains available for exact comparisons with
-the visual controller. Figures are generated separately by
+Each checkpoint is evaluated for `--episodes` episodes in compiled accelerator
+batches. Raw episode data, aggregate statistics and run metadata are written to
+the output directory. Figures are generated separately by
 ``python -m src.plot_evaluation_results``.
 """
 
@@ -33,12 +28,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.algorithms.bosco_guide import make_guides
-from src.algorithms.bosco import BoscoExpert
-from src.algorithms.jax_bosco import JaxGuideState, jax_guide_step
 from src.algorithms.mappo import RunningMeanStd, rms_normalize
 from src.envs.vec_env import VecEnv
-from src.envs.coverage_vector_env import MultiRobotCoverageEnv
 from src.models.actor_critic import Actor
 from src.utils.config_parser import load_config
 from src.utils.jax_device import describe, select_device
@@ -46,8 +37,6 @@ from src.utils.jax_device import describe, select_device
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "mappo_baseline.yaml"
-DEFAULT_NO_HUMANS = ROOT / "checkpoints/archive/no_humans_update1970/checkpoint_bosco.pkl"
-DEFAULT_HUMANS8 = ROOT / "checkpoints/archive/humans8_perfect_update4440/checkpoint_bosco.pkl"
 
 FIELDS = [
     "policy", "episode", "seed", "num_humans", "steps",
@@ -63,9 +52,8 @@ FIELDS = [
 @dataclass(frozen=True)
 class PolicySpec:
     name: str
-    kind: str
     humans: int
-    checkpoint: Path | None = None
+    checkpoint: Path
 
 
 def _env_config(path: Path, humans: int, max_steps: int | None) -> tuple[dict, dict]:
@@ -117,141 +105,45 @@ def _record(name: str, episode: int, seed: int, humans: int, steps: int,
     }
 
 
-def _guided_initial_state(vec_env: VecEnv, key: jax.Array):
-    state, obs, _, _ = vec_env.reset(key)
-    guides = make_guides(vec_env.env, vec_env.E)
-    pos = np.asarray(state.robot_positions)
-    cov = np.asarray(state.coverage_grid)
-    e_count, n_robots = vec_env.E, vec_env.num_robots
-    max_tour_len = 2048
-    tours = np.full((e_count, n_robots, max_tour_len), -1, np.int32)
-    lens = np.zeros((e_count, n_robots), np.int32)
-    indices = np.zeros((e_count, n_robots), np.int32)
-    targets = np.full((e_count, n_robots), -1, np.int32)
-    assignments = np.zeros((e_count, n_robots, vec_env.grid_h, vec_env.grid_w), np.float32)
-    for e, guide in enumerate(guides):
-        guide.reset(pos[e])
-        owner = guide.owner.reshape(vec_env.grid_h, vec_env.grid_w)
-        assignments[e] = np.stack([owner == r for r in range(n_robots)])
-        targets[e], _ = guide.update(pos[e], cov[e])
-        for r, tour in enumerate(guide.tours):
-            length = min(len(tour), max_tour_len)
-            lens[e, r] = length
-            tours[e, r, :length] = tour[:length]
-            indices[e, r] = min(int(guide.idx[r]), length)
-    graph = guides[0].graph
-    coords = graph.centers[np.maximum(targets, 0)]
-    target_coords = np.where((targets >= 0)[..., None], coords, pos)
-    state, obs, _ = vec_env.update_bosco(state, jnp.asarray(target_coords))
-    state, obs, _ = vec_env.update_cell_assignments(state, jnp.asarray(assignments))
-    cell_size = vec_env.env.cell_size
-    col = np.clip((pos[..., 0] / cell_size).astype(np.int32), 0, vec_env.grid_w - 1)
-    row = np.clip((pos[..., 1] / cell_size).astype(np.int32), 0, vec_env.grid_h - 1)
-    guide_state = JaxGuideState(
-        target=jnp.asarray(targets), prev_cell=jnp.asarray(row * vec_env.grid_w + col),
-        fail_cov=jnp.full((e_count, n_robots), -1, jnp.int32),
-        idx=jnp.asarray(indices), tours=jnp.asarray(tours),
-        tour_lens=jnp.asarray(lens),
-    )
-    return state, obs, guide_state, graph
-
-
 def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                   max_steps: int | None, batch_size: int, chunk_steps: int,
                   stochastic: bool, device, progress_every: int) -> list[dict]:
-    if spec.checkpoint is not None and not spec.checkpoint.is_file():
+    if not spec.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {spec.checkpoint}")
     config, env_cfg = _env_config(config_path, spec.humans, max_steps)
-    actor = params = rms = None
-    checkpoint = {}
-    if spec.kind == "marl":
-        assert spec.checkpoint is not None
-        with spec.checkpoint.open("rb") as handle:
-            checkpoint = pickle.load(handle)
+    with spec.checkpoint.open("rb") as handle:
+        checkpoint = pickle.load(handle)
     recurrent = checkpoint.get("actor_recurrent", False)
-    guided = checkpoint.get("actor_bosco_guidance", True)
-    env_cfg["actor_bosco_guidance"] = guided
-    env_cfg["bosco_reward_guidance"] = checkpoint.get("bosco_reward_guidance", True)
     env_cfg.update(checkpoint.get("reward_weights", {}))
+    env_cfg.update(checkpoint.get("obs_config", {"obs_mode": "legacy"}))
     vec_env = VecEnv(min(batch_size, episodes), env_cfg)
     env = vec_env.env
-    if spec.kind == "marl":
-        model_cfg = config.get("model", {})
-        actor = Actor(recurrent=recurrent, action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
-                      n_rays=env.n_rays, tail_dim=env.patch_dim,
-                      lidar_embed=model_cfg.get("lidar_embed", 64),
-                      hidden_size=model_cfg.get("hidden_size", 128))
-        params = jax.device_put(checkpoint["actor_params"], device)
-        rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))
-    if guided:
-        state, obs, guide_state, graph = _guided_initial_state(
-            vec_env, jax.random.PRNGKey(seed)
-        )
-        neighbors = jnp.asarray(graph.neighbors, jnp.int32)
-        free = jnp.asarray(graph.free, jnp.bool_)
-        components = jnp.asarray(graph.component, jnp.int32)
-        centers = jnp.asarray(graph.centers, jnp.float32)
-    else:
-        state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
-        guide_state = None
-
+    model_cfg = config.get("model", {})
+    actor = Actor(recurrent=recurrent, action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
+                  n_rays=env.n_rays, tail_dim=env.patch_dim,
+                  lidar_embed=model_cfg.get("lidar_embed", 64),
+                  hidden_size=model_cfg.get("hidden_size", 128))
+    params = jax.device_put(checkpoint["actor_params"], device)
+    rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))
+    state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
 
     memory = jnp.zeros((vec_env.E * env.num_robots, actor.hidden_size)) if recurrent else None
 
     def run_chunk(carry, keys):
         def one(c, action_key):
-            state, obs, guide_state, memory = c
-            if spec.kind == "marl":
-                normalized = rms_normalize(rms, obs)
-                if recurrent:
-                    mean, log_std, memory = actor.apply(
-                        params, normalized.reshape(-1, env.obs_dim), memory)
-                else:
-                    mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
-                if stochastic:
-                    z = mean + jnp.exp(log_std) * jax.random.normal(action_key, mean.shape)
-                    actions = jnp.tanh(z)
-                else:
-                    actions = jnp.tanh(mean)
-                actions = actions.reshape(vec_env.E, env.num_robots, env.action_dim)
+            state, obs, memory = c
+            normalized = rms_normalize(rms, obs)
+            if recurrent:
+                mean, log_std, memory = actor.apply(
+                    params, normalized.reshape(-1, env.obs_dim), memory)
             else:
-                valid = guide_state.target >= 0
-                target = centers[jnp.maximum(guide_state.target, 0)]
-                anchor_valid = guide_state.prev_cell >= 0
-                anchor = centers[jnp.maximum(guide_state.prev_cell, 0)]
-                anchor = jnp.where(anchor_valid[..., None], anchor,
-                                   state.robot_positions)
-                leg = target - anchor
-                leg_length = jnp.maximum(jnp.linalg.norm(leg, axis=-1), 1e-6)
-                direction = leg / leg_length[..., None]
-                progress = jnp.clip(
-                    jnp.sum((state.robot_positions - anchor) * direction, axis=-1),
-                    0.0, leg_length,
-                )
-                aim = anchor + direction * jnp.minimum(
-                    leg_length, progress + 0.25
-                )[..., None]
-                delta = aim - state.robot_positions
-                desired = jnp.arctan2(delta[..., 1], delta[..., 0])
-                angle = (desired - state.robot_headings + jnp.pi) % (2 * jnp.pi) - jnp.pi
-                turn = jnp.clip(3.0 * angle / env.omega_max, -1.0, 1.0)
-                # A cell-centre waypoint often changes direction by 90 degrees.
-                # Driving during that turn gives this differential-drive model a
-                # one-metre turning radius, much wider than a half-metre cell,
-                # and used to wedge the nominal BOSCO baseline into walls.  Make
-                # the adapter rotate first, then cross the next graph edge.
-                distance = jnp.maximum(
-                    leg_length - progress,
-                    jnp.linalg.norm(target - state.robot_positions, axis=-1),
-                )
-                speed = jnp.where(
-                    jnp.abs(angle) <= 0.10,
-                    jnp.clip(distance / (env.v_max * env.dt), 0.0, 1.0),
-                    0.0,
-                )
-                actions = jnp.stack([2.0 * speed - 1.0, turn], axis=-1)
-                actions = jnp.where(valid[..., None], actions,
-                                    jnp.array([-1.0, 0.0], jnp.float32))
+                mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
+            if stochastic:
+                z = mean + jnp.exp(log_std) * jax.random.normal(action_key, mean.shape)
+                actions = jnp.tanh(z)
+            else:
+                actions = jnp.tanh(mean)
+            actions = actions.reshape(vec_env.E, env.num_robots, env.action_dim)
             next_state, next_obs, rewards, term, done, info, _ = vec_env.step(state, actions)
             previous_col = jnp.clip(
                 (state.robot_positions[..., 0] / env.cell_size).astype(jnp.int32),
@@ -275,26 +167,6 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             covered_before = state.coverage_grid.reshape(vec_env.E, -1)
             env_ids = jnp.arange(vec_env.E)[:, None]
             revisited = entered & (covered_before[env_ids, current_cell] > 0.5)
-            next_guide = None
-            if guided:
-                safe_target = jnp.maximum(guide_state.target, 0)
-                target_center = centers[safe_target]
-                target_arrived = ((guide_state.target >= 0)
-                                  & (jnp.linalg.norm(
-                                      next_state.robot_positions - target_center,
-                                      axis=-1,
-                                  ) < 0.06))
-                next_guide, waypoint, _ = jax_guide_step(
-                    guide_state, next_state.robot_positions, next_state.coverage_grid, done,
-                    neighbors, vec_env.grid_w, vec_env.grid_h, env.cell_size,
-                    free_cells=free, graph_components=components,
-                    previous_coverage_grid=state.coverage_grid,
-                    target_arrived=(target_arrived if spec.kind == "bosco" else None),
-                )
-                valid = waypoint >= 0
-                coords = centers[jnp.maximum(waypoint, 0)]
-                target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
-                next_state, next_obs, _ = vec_env.update_bosco(next_state, target_coords)
             output = (rewards.sum(axis=-1), done, term, info["coverage_ratio"],
                       info["covered_cells"], info["complete"], info["timeout"],
                       info["wall_collision_rate"], info["robot_collision_rate"],
@@ -302,7 +174,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                       jnp.sum(entered, axis=-1))
             if recurrent:
                 memory = jnp.where(jnp.repeat(done, env.num_robots)[:, None], 0., memory)
-            return (next_state, next_obs, next_guide, memory), output
+            return (next_state, next_obs, memory), output
         return jax.lax.scan(one, carry, keys)
 
     run_chunk = jax.jit(run_chunk)
@@ -315,7 +187,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     while len(rows) < episodes:
         key, chunk_key = jax.random.split(key)
         keys = jax.random.split(chunk_key, chunk_steps)
-        (state, obs, guide_state, memory), outputs = run_chunk((state, obs, guide_state, memory), keys)
+        (state, obs, memory), outputs = run_chunk((state, obs, memory), keys)
         arrays = [np.asarray(x) for x in jax.device_get(outputs)]
         (rewards, dones, terms, coverage, covered, complete, timeout, walls,
          robots, humans, revisits, entries) = arrays
@@ -353,83 +225,6 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             print(f"{spec.name}: {len(rows)}/{episodes} ({100 * len(rows) / episodes:.1f}%) "
                   f"| elapsed {elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
     return rows
-
-
-def evaluate_bosco(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
-                   max_steps: int | None, progress_every: int) -> list[dict]:
-    """Evaluate the same host-side BOSCO expert used by ``test_visual``."""
-    _, env_cfg = _env_config(config_path, spec.humans, max_steps)
-    env = MultiRobotCoverageEnv(env_cfg)
-    expert = BoscoExpert(env)
-    step = jax.jit(env.step)
-    rows = []
-    started = time.time()
-    print(f"{spec.name}: starting {episodes} episodes (visual BOSCO controller)",
-          flush=True)
-    for episode in range(episodes):
-        state = env.reset(jax.random.PRNGKey(seed + episode))
-        expert.reset(np.asarray(state.robot_positions),
-                     map_id=int(np.asarray(state.map_id)))
-        steps = 0
-        team_return = wall = robot = human = revisits = entries = 0.0
-        previous_cell = expert.graph.cell_of(np.asarray(state.robot_positions))
-        terminated = truncated = False
-        while not (terminated or truncated):
-            actions = expert.act(
-                np.asarray(state.robot_positions),
-                np.asarray(state.robot_headings),
-                np.asarray(state.coverage_grid),
-            )
-            covered_before = np.asarray(state.coverage_grid).reshape(-1) > 0.5
-            state, rewards, terminated_array, truncated_array = step(
-                state, jnp.asarray(actions)
-            )
-            terminated = bool(terminated_array)
-            truncated = bool(truncated_array)
-            current_cell = expert.graph.cell_of(np.asarray(state.robot_positions))
-            entered = current_cell != previous_cell
-            entries += float(np.sum(entered))
-            revisits += float(np.sum(entered & covered_before[current_cell]))
-            previous_cell = current_cell
-            team_return += float(np.sum(np.asarray(rewards)))
-            wall += float(np.sum(np.asarray(state.wall_hits)))
-            robot += float(np.sum(np.asarray(state.robot_hits)))
-            human += float(np.sum(np.asarray(state.human_hits)))
-            steps += 1
-
-        info = env.get_info(state)
-        complete = float(info["complete"])
-        rows.append(_record(
-            spec.name, episode, seed, spec.humans, steps,
-            float(info["coverage_ratio"]), float(info["covered_cells"]), complete,
-            float(bool(truncated) and not complete), team_return, wall, robot, human,
-            env.num_robots, env.dt, float(bool(terminated) and not complete),
-            revisits, entries, (entries - revisits) / max(entries, 1.0),
-        ))
-        if progress_every and ((episode + 1) % progress_every == 0
-                               or episode + 1 == episodes):
-            elapsed = time.time() - started
-            done_count = episode + 1
-            eta = elapsed / done_count * (episodes - done_count)
-            print(f"{spec.name}: {done_count}/{episodes} "
-                  f"({100 * done_count / episodes:.1f}%) | "
-                  f"elapsed {elapsed / 60:.1f} min | ETA {eta / 60:.1f} min",
-                  flush=True)
-    return rows
-
-
-def evaluate_spec(spec: PolicySpec, args: argparse.Namespace, device) -> list[dict]:
-    """Evaluate one policy through the selected execution engine."""
-    if spec.kind == "bosco" and args.bosco_mode == "host":
-        return evaluate_bosco(
-            spec, args.config, args.episodes, args.seed, args.max_steps,
-            args.progress_every,
-        )
-    return evaluate_marl(
-        spec, args.config, args.episodes, args.seed, args.max_steps,
-        args.batch_size, args.chunk_steps, args.stochastic, device,
-        args.progress_every,
-    )
 
 
 def write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
@@ -568,25 +363,20 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--checkpoint", type=Path, action="append", required=True,
+                        help="policy checkpoint to evaluate; repeat to compare several")
+    parser.add_argument("--label", action="append", default=None,
+                        help="display name per --checkpoint (default: parent/file name)")
     parser.add_argument("--humans", type=int, default=8,
-                        help="humans in dynamic-obstacle evaluations (default: 8); an additional plain BOSCO baseline always uses 0")
+                        help="humans during evaluation (default: 8)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--no-humans-checkpoint", type=Path, default=DEFAULT_NO_HUMANS)
-    parser.add_argument("--humans8-checkpoint", type=Path, default=DEFAULT_HUMANS8)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "evaluation_results")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--chunk-steps", type=int, default=256)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--backend", choices=("auto", "cpu", "cuda", "metal"), default="auto")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of using tanh(policy mean)")
-    parser.add_argument("--e2e-checkpoint", type=Path, default=None,
-                        help="Add an end-to-end MARL policy to the comparison")
-    parser.add_argument("--bosco-mode", choices=("jax", "host"), default="host",
-                        help="BOSCO execution engine: GPU/CPU-vectorized JAX or "
-                             "the exact serial visual controller (default: host)")
-    parser.add_argument("--skip-bosco", action="store_true")
-    parser.add_argument("--skip-marl", action="store_true")
     parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
@@ -597,29 +387,20 @@ def main() -> None:
         raise SystemExit("episodes, batch-size and chunk-steps must be positive; humans cannot be negative")
     device = select_device(None if args.backend == "auto" else args.backend)
     print(f"Device: {describe(device)}")
-    bosco_label = "BOSCO JAX" if args.bosco_mode == "jax" else "Plain BOSCO"
-    specs = [
-        PolicySpec(f"{bosco_label} (0 humans)", "bosco", 0),
-        PolicySpec(f"{bosco_label} ({args.humans} humans)", "bosco", args.humans),
-        PolicySpec("BOSCO MARL (trained: 0 humans)", "marl", args.humans,
-                   args.no_humans_checkpoint),
-        PolicySpec("BOSCO MARL (trained: 8 humans)", "marl", args.humans,
-                   args.humans8_checkpoint),
-    ]
-    if args.e2e_checkpoint is not None:
-        specs.append(PolicySpec("End-to-end MARL (CTDE)", "marl", args.humans,
-                                args.e2e_checkpoint))
-    if args.skip_bosco:
-        specs = [s for s in specs if s.kind != "bosco"]
-    if args.skip_marl:
-        specs = [s for s in specs if s.kind != "marl"]
-    if not specs:
-        raise SystemExit("No policies selected")
+    labels = args.label or [f"{c.parent.name}/{c.name}" for c in args.checkpoint]
+    if len(labels) != len(args.checkpoint):
+        raise SystemExit("Give one --label per --checkpoint, or none")
+    specs = [PolicySpec(label, args.humans, path)
+             for label, path in zip(labels, args.checkpoint)]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     rows = []
     for spec in specs:
-        rows.extend(evaluate_spec(spec, args, device))
+        rows.extend(evaluate_marl(
+            spec, args.config, args.episodes, args.seed, args.max_steps,
+            args.batch_size, args.chunk_steps, args.stochastic, device,
+            args.progress_every,
+        ))
     raw_path = args.output_dir / "episodes.csv"
     write_csv(raw_path, rows, FIELDS)
     summary = summarize(rows)
@@ -627,12 +408,10 @@ def main() -> None:
     write_csv(args.output_dir / "summary.csv", summary, summary_fields)
     metadata = {
         "episodes_per_policy": args.episodes, "seed": args.seed,
-        "dynamic_obstacle_evaluation_humans": args.humans,
-        "plain_bosco_evaluation_humans": [0, args.humans],
+        "evaluation_humans": args.humans,
         "config": str(args.config.resolve()), "backend": describe(device),
         "stochastic": args.stochastic, "elapsed_seconds": time.time() - started,
-        "bosco_mode": args.bosco_mode,
-        "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve()) if s.checkpoint else None} for s in specs],
+        "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve())} for s in specs],
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Saved raw data, summary and metadata to {args.output_dir}")

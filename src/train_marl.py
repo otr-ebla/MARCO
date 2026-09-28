@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Train MAPPO with BOSCO guidance or an end-to-end actor under CTDE.
+"""Train an end-to-end multi-robot coverage policy with MAPPO or IPPO (CTDE).
 
-`--policy-mode guided` preserves target deltas in actor observations and BOSCO
-reward shaping. `--policy-mode end-to-end` removes those two input channels and
-all planner-dependent rewards, including assignment-weighted discoveries.
-Guided mode keeps its single-map BOSCO graph; end-to-end modes bypass the planner
-entirely and sample independently from a procedural map bank.
+Actors act only on their own observation and command velocities; every
+environment samples a layout independently from a procedural map bank.
 
-    python -m src.train_bosco --policy-mode end-to-end --save-dir checkpoints/e2e
+    python -m src.train_marl --policy-mode end-to-end --save-dir checkpoints/e2e
 
 `--policy-mode end-to-end-memory` adds a GRU to the local actor with the same
 observation width and reward as end-to-end. Memory resets at episode boundaries;
@@ -28,8 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.algorithms.bosco_guide import make_guides
-from src.algorithms.jax_bosco import JaxGuideState, jax_guide_step
+from src.algorithms.ippo import IPPO
 from src.algorithms.mappo import (
     MAPPO,
     RunningMeanStd,
@@ -42,7 +38,7 @@ from src.algorithms.mappo import (
 )
 from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
 from src.envs.vec_env import VecEnv
-from src.models.actor_critic import Actor, Critic
+from src.models.actor_critic import Actor, Critic, LocalCritic
 from src.train_simple import (
     _COLLISION,
     _SUCCESS,
@@ -62,8 +58,9 @@ from src.utils.human_curriculum import ghost_robot_probability
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
-                    guide_dim: int, guide_bonus: float = 2.0,
-                    policy_mode: str = "guided", reward_weights: dict | None = None) -> None:
+                    tail_dim: int,
+                    policy_mode: str = "end-to-end", reward_weights: dict | None = None,
+                    obs_config: dict | None = None, algo: str = "mappo") -> None:
     """Save parameters, normalizer and the actor/reward regime for evaluation."""
     payload = {
         'update':        update,
@@ -72,14 +69,13 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         'actor_opt':     jax.device_get(actor_state.opt_state),
         'critic_opt':    jax.device_get(critic_state.opt_state),
         'obs_rms':       jax.device_get(rms),
-        'guide_dim':     int(guide_dim),
-        'bosco_guided':  policy_mode == 'guided',
+        'tail_dim':      int(tail_dim),
         'policy_mode': policy_mode,
         'actor_recurrent': policy_mode == 'end-to-end-memory',
-        'actor_bosco_guidance': policy_mode == 'guided',
-        'bosco_reward_guidance': policy_mode == 'guided',
-        'guide_bonus':   float(guide_bonus),
         'reward_weights': dict(reward_weights or {}),
+        # Env keys that fix the actor's input layout, restored by evaluators.
+        'obs_config': dict(obs_config or {'obs_mode': 'legacy'}),
+        'algo': algo,
     }
     # Publish only a fully-written pickle so evaluators can safely load it while
     # training continues. os.replace is atomic when source and target share a
@@ -144,17 +140,16 @@ def load_checkpoint(path: str, actor_state, critic_state, device,
 
 
 # ---------------------------------------------------------------------------
-# Guided rollout
+# Rollout
 # ---------------------------------------------------------------------------
 
-class GuidedCarry(NamedTuple):
+class RolloutCarry(NamedTuple):
     """Rollout state threaded between updates."""
 
     env_state: object
     obs:       jax.Array      # actor inputs for the selected policy mode
     gstate:    object
     rms:       object
-    guide_state: JaxGuideState
     episode_stats: object
     smoothed_col_rate: jax.Array
     smoothed_coverage_rate: jax.Array
@@ -169,14 +164,12 @@ class DeviceEpisodeStats(NamedTuple):
     wall:      jax.Array
     robot:     jax.Array
     human:     jax.Array
-    hits:      jax.Array
     recent_reward:   jax.Array
     recent_coverage: jax.Array
     recent_length:   jax.Array
     recent_wall:     jax.Array
     recent_robot:    jax.Array
     recent_human:    jax.Array
-    recent_hits:     jax.Array
     recent_outcome:  jax.Array
     ring_pos:   jax.Array
     ring_count: jax.Array
@@ -192,14 +185,12 @@ def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
         wall=zeros_e,
         robot=zeros_e,
         human=zeros_e,
-        hits=zeros_e,
         recent_reward=zeros_w,
         recent_coverage=zeros_w,
         recent_length=zeros_w,
         recent_wall=zeros_w,
         recent_robot=zeros_w,
         recent_human=zeros_w,
-        recent_hits=zeros_w,
         recent_outcome=jnp.zeros((_WINDOW,), jnp.int32),
         ring_pos=jnp.int32(0),
         ring_count=jnp.int32(0),
@@ -208,7 +199,7 @@ def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
 
 
 def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
-                        reached: jax.Array, reward_scale: float) -> DeviceEpisodeStats:
+                        reward_scale: float) -> DeviceEpisodeStats:
     """Consume one vectorised transition without copying trajectory data to host."""
     stats = stats._replace(
         reward=stats.reward + jnp.mean(trans.reward, axis=-1) / reward_scale,
@@ -216,7 +207,6 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
         wall=stats.wall + trans.wall_hit,
         robot=stats.robot + trans.robot_hit,
         human=stats.human + trans.human_hit,
-        hits=stats.hits + jnp.mean(reached, axis=-1),
     )
 
     def one_env(s, xs):
@@ -235,14 +225,12 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
                 recent_wall=x.recent_wall.at[pos].set(x.wall[env_idx]),
                 recent_robot=x.recent_robot.at[pos].set(x.robot[env_idx]),
                 recent_human=x.recent_human.at[pos].set(x.human[env_idx]),
-                recent_hits=x.recent_hits.at[pos].set(x.hits[env_idx]),
                 recent_outcome=x.recent_outcome.at[pos].set(outcome),
                 reward=x.reward.at[env_idx].set(0.0),
                 length=x.length.at[env_idx].set(0),
                 wall=x.wall.at[env_idx].set(0.0),
                 robot=x.robot.at[env_idx].set(0.0),
                 human=x.human.at[env_idx].set(0.0),
-                hits=x.hits.at[env_idx].set(0.0),
                 ring_pos=(pos + 1) % _WINDOW,
                 ring_count=jnp.minimum(x.ring_count + 1, _WINDOW),
                 total_count=x.total_count + 1,
@@ -259,19 +247,10 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
     return stats
 
 
-class GuidedRollout:
-    def __init__(self, mappo: MAPPO, vec_env: VecEnv, guides, guide_bonus: float):
+class Rollout:
+    def __init__(self, mappo: MAPPO, vec_env: VecEnv):
         self.mappo = mappo
         self.env = vec_env
-        self.guides = guides
-        self.guided = guides is not None
-        self.bonus = float(guide_bonus)
-        if self.guided:
-            self.graph = guides[0].graph
-            self.graph_neighbors = jnp.asarray(self.graph.neighbors, jnp.int32)
-            self.graph_free = jnp.asarray(self.graph.free, jnp.bool_)
-            self.graph_components = jnp.asarray(self.graph.component, jnp.int32)
-            self.graph_centers = jnp.asarray(self.graph.centers, jnp.float32)
         e, n = vec_env.E, vec_env.num_robots
 
         @jax.jit
@@ -288,16 +267,21 @@ class GuidedRollout:
             z = mean + std * jax.random.normal(key, mean.shape)
             action = jnp.tanh(z)
             log_prob = _tanh_normal_log_prob(z, mean, std, action).reshape(e, n)
-            value = mappo._values(critic_params, gstate)
+            value = mappo._values(critic_params, obs_n, gstate)
             return (obs_n, action.reshape(e, n, -1), z.reshape(e, n, -1),
                     log_prob, value, rms, memory)
 
         self._act = act
-        self._value_fn = jax.jit(mappo._values)
+        # Bootstrap value on the post-rollout observation, normalised with the
+        # final statistics (IPPO's critic reads it; MAPPO's ignores it).
+        self._value_fn = jax.jit(
+            lambda params, rms, obs, gstate: mappo._values(
+                params, rms_normalize(rms, obs), gstate)
+        )
         
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
-                (state, obs, gstate, rms, guide_state, episode_stats,
+                (state, obs, gstate, rms, episode_stats,
                  smoothed_col_rate, smoothed_coverage_rate, memory) = c
                 
                 obs_n, action, z, log_prob, value, rms, next_memory = act(
@@ -306,34 +290,6 @@ class GuidedRollout:
                 (next_state, next_obs, reward, term, done, info,
                  next_gstate) = vec_env.step(state, action)
 
-                if self.guided:
-                    new_guide_state, waypoint, reached = jax_guide_step(
-                        guide_state,
-                        next_state.robot_positions,
-                        next_state.coverage_grid,
-                        done,
-                        self.graph_neighbors,
-                        vec_env.grid_w,
-                        vec_env.grid_h,
-                        vec_env.env.cell_size,
-                        free_cells=self.graph_free,
-                        graph_components=self.graph_components,
-                        previous_coverage_grid=state.coverage_grid,
-                    )
-
-                    valid = waypoint >= 0
-                    safe_targets = jnp.maximum(waypoint, 0)
-                    coords = self.graph_centers[safe_targets]
-                    target_coords = jnp.where(
-                        valid[..., None], coords, next_state.robot_positions
-                    )
-                    next_state, next_obs, next_gstate = vec_env.update_bosco(
-                        next_state, target_coords
-                    )
-                else:
-                    new_guide_state = None
-                    reached = jnp.zeros((e, n), jnp.bool_)
-                
                 if mappo.actor.recurrent:
                     next_memory = jnp.where(jnp.repeat(done, n)[:, None], 0., next_memory)
                 trans = Transition(
@@ -343,7 +299,7 @@ class GuidedRollout:
                     action=action,
                     z=z,
                     log_prob=log_prob,
-                    reward=(reward + self.bonus * jnp.asarray(reached, jnp.float32)) * self.mappo.reward_scale,
+                    reward=reward * self.mappo.reward_scale,
                     value=value,
                     term=term.astype(jnp.float32),
                     done=done.astype(jnp.float32),
@@ -356,149 +312,79 @@ class GuidedRollout:
                 )
 
                 episode_stats = _episode_stats_step(
-                    episode_stats, trans, reached, self.mappo.reward_scale
+                    episode_stats, trans, self.mappo.reward_scale
                 )
                 
-                next_carry = GuidedCarry(
-                    next_state, next_obs, next_gstate, rms, new_guide_state,
+                next_carry = RolloutCarry(
+                    next_state, next_obs, next_gstate, rms,
                     episode_stats, smoothed_col_rate, smoothed_coverage_rate, next_memory,
                 )
-                return next_carry, (trans, reached)
+                return next_carry, trans
                 
             return jax.lax.scan(scan_step, carry, keys)
 
         self._jitted_run = jax.jit(jitted_run)
 
-    @staticmethod
-    def _host(state, done=None):
-        payload = (state.robot_positions, state.robot_headings, state.coverage_grid)
-        return jax.device_get(payload if done is None else payload + (done,))
-
-    def start(self, key: jax.Array) -> GuidedCarry:
+    def start(self, key: jax.Array) -> RolloutCarry:
         state, obs, gstate, _ = self.env.reset(key)
         E, N = self.env.E, self.env.num_robots
         memory = (
             jnp.zeros((E * N, self.mappo.actor.hidden_size), jnp.float32)
             if self.mappo.actor.recurrent else None
         )
-        if not self.guided:
-            return GuidedCarry(
-                state, obs, gstate, rms_init(self.env.norm_dim), None,
-                _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
-                memory,
-            )
-
-        pos, hdg, cov = self._host(state)
-        
-        MAX_TOUR_LEN = 2048
-        tours = np.full((E, N, MAX_TOUR_LEN), -1, dtype=np.int32)
-        tour_lens = np.zeros((E, N), dtype=np.int32)
-        targets = np.full((E, N), -1, dtype=np.int32)
-        assignments = np.zeros(
-            (E, N, self.env.grid_h, self.env.grid_w), dtype=np.float32
-        )
-        
-        for e in range(E):
-            self.guides[e].reset(pos[e])
-            owner = self.guides[e].owner.reshape(self.env.grid_h, self.env.grid_w)
-            assignments[e] = np.stack([owner == r for r in range(N)]).astype(np.float32)
-            for r in range(N):
-                tour = self.guides[e].tours[r]
-                t_len = min(len(tour), MAX_TOUR_LEN)
-                tour_lens[e, r] = t_len
-                tours[e, r, :t_len] = tour[:MAX_TOUR_LEN]
-            targets[e], _ = self.guides[e].update(pos[e], cov[e])
-            
-        valid = targets >= 0
-        safe_targets = np.maximum(targets, 0)
-        coords = self.graph.centers[safe_targets]
-        target_coords = np.where(valid[..., None], coords, pos)
-        
-        state, obs, gstate = self.env.update_bosco(
-            state, jnp.asarray(target_coords, dtype=jnp.float32)
-        )
-        state, obs, gstate = self.env.update_cell_assignments(
-            state, jnp.asarray(assignments)
-        )
-        
-        cell_size = self.env.env.cell_size
-        col = np.clip((pos[..., 0] / cell_size).astype(np.int32), 0, self.env.grid_w - 1)
-        row = np.clip((pos[..., 1] / cell_size).astype(np.int32), 0, self.env.grid_h - 1)
-        cell = row * self.env.grid_w + col
-        
-        guide_state = JaxGuideState(
-            target=jnp.asarray(targets, jnp.int32),
-            prev_cell=jnp.asarray(cell, jnp.int32),
-            fail_cov=jnp.full((E, N), -1, dtype=jnp.int32),
-            idx=jnp.zeros((E, N), dtype=jnp.int32),
-            tours=jnp.asarray(tours, jnp.int32),
-            tour_lens=jnp.asarray(tour_lens, jnp.int32)
-        )
-        
-        return GuidedCarry(
-            state, obs, gstate, rms_init(self.env.norm_dim), guide_state,
+        return RolloutCarry(
+            state, obs, gstate, rms_init(self.env.norm_dim),
             _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
             memory,
         )
 
-    def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
+    def run(self, actor_params, critic_params, carry: RolloutCarry, num_steps: int, key: jax.Array):
         keys = jax.random.split(key, num_steps)
-        final_carry, (traj, hits) = self._jitted_run(actor_params, critic_params, carry, keys)
-        last_value = self._value_fn(critic_params, final_carry.gstate)
-        return final_carry, traj, last_value, hits
+        final_carry, traj = self._jitted_run(actor_params, critic_params, carry, keys)
+        last_value = self._value_fn(critic_params, final_carry.rms,
+                                    final_carry.obs, final_carry.gstate)
+        return final_carry, traj, last_value
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-# Kept apart from `train_simple`'s own outputs: the two policies are not
-# interchangeable — a guided actor rejects a bare environment observation — so
-# writing both to `checkpoint_final.pkl` would silently destroy the baseline.
-CHECKPOINT_NAME = 'checkpoint_bosco.pkl'
-LATEST_CHECKPOINT_NAME = 'checkpoint_bosco_latest.pkl'
-LOG_NAME        = 'training_log_bosco.csv'
-
-
-def policy_checkpoint_score(policy_mode, completion, coverage, contacts, reward):
-    """Rank completed-episode metrics for checkpoint selection."""
-    if policy_mode in ("end-to-end", "end-to-end-memory"):
-        return (completion, coverage, -contacts, reward)
-    return (completion, -contacts, coverage, reward)
+def policy_checkpoint_score(completion, coverage, contacts, reward):
+    """Rank completed-episode metrics for checkpoint selection. Coverage comes
+    before contacts so low-motion policies are never preferred."""
+    return (completion, coverage, -contacts, reward)
 
 
 def train(config_path: str, save_dir: str, resume: str | None,
-          backend: str | None = None, guide_bonus: float = 10.0,
+          backend: str | None = None,
           wandb_overrides: dict | None = None, num_humans: int = 0,
-          num_envs: int | None = None, policy_mode: str = "guided",
+          num_envs: int | None = None, policy_mode: str = "end-to-end",
           num_maps: int | None = None,
-          additional_updates: int | None = None):
-    if policy_mode not in ('guided', 'end-to-end', 'end-to-end-memory'):
+          additional_updates: int | None = None,
+          obs_mode: str | None = None, algo: str = "mappo"):
+    if policy_mode not in ('end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
+    if algo not in ('mappo', 'ippo'):
+        raise ValueError(f'Unknown algo: {algo}')
     config = load_config(config_path)
+    if obs_mode is not None:
+        config.setdefault('env', {})['obs_mode'] = obs_mode
     device = select_device(backend)
     print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
 
     env_cfg = config.setdefault('env', {})
-    env_cfg['actor_bosco_guidance'] = policy_mode == 'guided'
-    env_cfg['bosco_reward_guidance'] = policy_mode == 'guided'
-    if policy_mode != 'guided':
-        guide_bonus = 0.0
-        env_cfg['num_maps'] = int(
-            num_maps if num_maps is not None
-            else config.get('e2e_num_maps', env_cfg.get('num_maps', 16))
-        )
-        reward_weights = {**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})}
-        unknown = set(reward_weights) - set(E2E_REWARD_DEFAULTS)
-        if unknown:
-            raise ValueError(f'Unknown e2e_reward keys: {sorted(unknown)}')
-        env_cfg.update(reward_weights)
-    else:
-        env_cfg['reward_mode'] = 'legacy'
-        reward_weights = {name: env_cfg[name] for name in ('wall_kappa', 'beta')
-                          if name in env_cfg}
-    checkpoint_name = CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e.pkl'
-    latest_name = LATEST_CHECKPOINT_NAME if policy_mode == 'guided' else 'checkpoint_e2e_latest.pkl'
-    log_name = LOG_NAME if policy_mode == 'guided' else 'training_log_e2e.csv'
+    env_cfg['num_maps'] = int(
+        num_maps if num_maps is not None
+        else config.get('e2e_num_maps', env_cfg.get('num_maps', 16))
+    )
+    reward_weights = {**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})}
+    unknown = set(reward_weights) - set(E2E_REWARD_DEFAULTS)
+    if unknown:
+        raise ValueError(f'Unknown e2e_reward keys: {sorted(unknown)}')
+    env_cfg.update(reward_weights)
+    checkpoint_name = 'checkpoint_e2e.pkl'
+    latest_name = 'checkpoint_e2e_latest.pkl'
+    log_name = 'training_log_e2e.csv'
     if policy_mode == 'end-to-end-memory':
         checkpoint_name = 'checkpoint_e2e_memory.pkl'
         latest_name = 'checkpoint_e2e_memory_latest.pkl'
@@ -513,17 +399,15 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
-    if policy_mode == 'guided' and env.num_maps != 1:
-        raise ValueError(
-            "BOSCO-guided training currently requires env.num_maps=1: the "
-            "accelerator rollout shares one traversability graph across all "
-            "environments. Multiple maps would produce invalid waypoints."
-        )
     E          = vec_env.E
     N          = vec_env.num_robots
     action_dim = vec_env.action_dim
     tail_dim = env.patch_dim
     obs_dim = env.obs_dim
+    obs_config = {'obs_mode': env.obs_mode}
+    if env.use_memory:
+        obs_config.update(comm_radius=env.comm_radius, comm_slots=env.comm_slots,
+                          local_coverage_size=env.local_coverage_size)
 
     lidar_embed = model_cfg.get('lidar_embed',  64)
     hidden_size = model_cfg.get('hidden_size', 128)
@@ -540,11 +424,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
     else:
         print(f"Map bank: {env.num_maps} layouts | coverable cells: "
               f"{int(free_totals.min())}-{int(free_totals.max())} / {env.num_cells}")
-    print(f"Policy: {policy_mode}; BOSCO arrival bonus {guide_bonus} "
-          f"(discovery alpha={env.alpha}, coverage growth="
-          f"{env.coverage_reward_growth})")
+    print(f"Policy: {policy_mode}")
 
-    print(f"Reward mode: {env.reward_mode}; weights: wall_kappa={env.wall_kappa:g}, beta={env.beta:g}")
+    print(f"Observation: {obs_config}")
+    print(f"Reward mode: {env.reward_mode}; weights: {reward_weights}")
 
     actor = Actor(
         recurrent=policy_mode == "end-to-end-memory",
@@ -555,12 +438,26 @@ def train(config_path: str, save_dir: str, resume: str | None,
         lidar_embed=lidar_embed,
         hidden_size=hidden_size,
     )
-    critic = Critic(
-        hidden_size=model_cfg.get('critic_hidden',    256),
-        map_embed=model_cfg.get('critic_map_embed', 128),
+    if algo == 'ippo':
+        critic = LocalCritic(
+            vec_dim=env.obs_vec_dim,
+            n_rays=env.n_rays,
+            tail_dim=tail_dim,
+            lidar_embed=lidar_embed,
+            hidden_size=model_cfg.get('critic_hidden', 256),
+        )
+    else:
+        critic = Critic(
+            hidden_size=model_cfg.get('critic_hidden',    256),
+            map_embed=model_cfg.get('critic_map_embed', 128),
+        )
+    mappo = (IPPO if algo == 'ippo' else MAPPO)(
+        actor, critic, vec_env, train_cfg, device=device
     )
-    mappo = MAPPO(actor, critic, vec_env, train_cfg, device=device)
     mappo.env = vec_env
+    print(f"Algorithm: {algo.upper()} ("
+          f"{'local critic V(o_i)' if algo == 'ippo' else 'centralised critic V_i(s)'}"
+          f", shared actor and critic parameters)")
 
     T             = train_cfg.get('rollout_steps',  256)
     total_updates = train_cfg.get('total_updates',  3000)
@@ -577,13 +474,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     actor_state, critic_state = mappo.create_train_states(init_key)
 
-    guides = make_guides(env, E) if policy_mode == 'guided' else None
-    if guides is not None:
-        print(f"Map: {env.grid_h}x{env.grid_w} cells, "
-              f"{int(guides[0]._isolated.sum())} unreachable by the robot disc")
-    else:
-        print(f"Maps: {env.grid_h}x{env.grid_w} cells, sampled independently on reset")
-    rollout = GuidedRollout(mappo, vec_env, guides, guide_bonus)
+    print(f"Maps: {env.grid_h}x{env.grid_w} cells, sampled independently on reset")
+    rollout = Rollout(mappo, vec_env)
     carry = rollout.start(reset_key)
 
     os.makedirs(save_dir, exist_ok=True)
@@ -618,8 +510,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
             'action_dim':       action_dim,
             'coverable_cells':  int(env.free_totals[0]),
             'steps_per_update': T * E,
-            'guide_bonus':      guide_bonus,
             'policy_mode':      policy_mode,
+            'obs_mode':         env.obs_mode,
+            'algo':             algo,
             
         },
     )
@@ -637,7 +530,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'wall_collisions_per_episode',
                                 'robot_collisions_per_episode',
                                 'human_collisions_per_episode',
-                                'guide_hits_per_episode', 'guide_hit_rate',
                                 'actor_loss', 'critic_loss', 'entropy', 'std'])
 
     best_policy_score = None
@@ -655,7 +547,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
         key, rollout_key = jax.random.split(key)
         prev_rms = carry.rms
-        carry, traj, last_value, hits = rollout.run(
+        carry, traj, last_value = rollout.run(
             actor_state.params, critic_state.params, carry, T, rollout_key
         )
         total_col_rate = (jnp.mean(traj.wall_hit)
@@ -683,15 +575,14 @@ def train(config_path: str, save_dir: str, resume: str | None,
             s = carry.episode_stats
             compact = jax.device_get((
                 s.recent_reward, s.recent_coverage, s.recent_length,
-                s.recent_wall, s.recent_robot, s.recent_human, s.recent_hits,
+                s.recent_wall, s.recent_robot, s.recent_human,
                 s.recent_outcome, s.ring_count, s.total_count,
                 jnp.mean(traj.coverage[-1]), jnp.mean(traj.wall_hit),
-                jnp.mean(traj.robot_hit), jnp.mean(traj.human_hit),
-                jnp.mean(hits), metrics,
+                jnp.mean(traj.robot_hit), jnp.mean(traj.human_hit), metrics,
             ))
             (recent_reward, recent_coverage, recent_length, recent_wall,
-             recent_robot, recent_human, recent_hits, recent_outcome, ring_count,
-             ep_count, last_cov, wall_rate, robot_rate, human_rate, guide_rate,
+             recent_robot, recent_human, recent_outcome, ring_count,
+             ep_count, last_cov, wall_rate, robot_rate, human_rate,
              losses) = compact
             count = int(ring_count)
             ep_count = int(ep_count)
@@ -706,18 +597,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
             ep_wall_mean = recent_mean(recent_wall)
             ep_robot_mean = recent_mean(recent_robot)
             ep_human_mean = recent_mean(recent_human)
-            ep_hit_mean = recent_mean(recent_hits)
             last_cov = float(last_cov)
             wall_rate = float(wall_rate)
             robot_rate = float(robot_rate)
             human_rate = float(human_rate)
-            # Fraction of robot-steps that ended on the waypoint. A robot needs
-            # ~5 steps to cross a 0.5 m cell at v_max, so 0.2 is the arithmetic
-            # ceiling, but BOSCO itself only reaches 0.095 on this map — a 90°
-            # lane change costs ~16 steps of turning in place, which buys no
-            # waypoint. That measured 0.095, not the ceiling, is what a policy
-            # tracking the tour as well as the planner does looks like.
-            guide_rate = float(guide_rate)
             outcomes = np.asarray(recent_outcome)[valid]
             if outcomes.size:
                 completion_rate    = float(np.mean(outcomes == _SUCCESS))
@@ -733,7 +616,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 f"ep_cov={mean_ep_cov:6.2%} | "
                 f"complete={completion_rate:6.2%} | "
                 f"coverage={last_cov:.2%} | "
-                f"guide={guide_rate:6.2%} | "
                 f"actor={float(losses['actor_loss']):7.4f} | "
                 f"critic={float(losses['critic_loss']):7.4f} | "
                 f"entropy={float(losses['entropy']):6.4f} | "
@@ -758,8 +640,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     round(ep_wall_mean,   4),
                     round(ep_robot_mean,  4),
                     round(ep_human_mean,  4),
-                    round(ep_hit_mean,    4),
-                    round(guide_rate,     6),
                     round(float(losses['actor_loss']),  4),
                     round(float(losses['critic_loss']), 4),
                     round(float(losses['entropy']),     4),
@@ -783,8 +663,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'collision/wall_per_episode':     ep_wall_mean,
                     'collision/robot_per_episode':    ep_robot_mean,
                     'collision/human_per_episode':    ep_human_mean,
-                    'guide/hit_per_robot_step':       guide_rate,
-                    'guide/hits_per_episode':         ep_hit_mean,
                     'loss/actor':                     float(losses['actor_loss']),
                     'loss/critic':                    float(losses['critic_loss']),
                     'loss/entropy':                   float(losses['entropy']),
@@ -792,10 +670,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'lr/actor':                       lr_a,
                     'lr/critic':                      lr_c,
                 }, step=update)
-            # End-to-end coverage comes before contacts to avoid selecting
-            # low-motion policies. Preserve the guided mode's existing ranking.
             policy_score = policy_checkpoint_score(
-                policy_mode, completion_rate, mean_ep_cov,
+                completion_rate, mean_ep_cov,
                 ep_wall_mean + ep_robot_mean + ep_human_mean, mean_ep_r,
             )
             if ep_count > 0 and (
@@ -804,7 +680,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 best_policy_score = policy_score
                 save_checkpoint(os.path.join(save_dir, checkpoint_name),
                                 update, actor_state, critic_state, carry.rms,
-                                tail_dim, guide_bonus, policy_mode, reward_weights)
+                                tail_dim, policy_mode, reward_weights,
+                                obs_config, algo)
                 print(
                     f"  → best policy saved (complete={completion_rate:.2%}, "
                     f"coverage={mean_ep_cov:.2%}, contacts/ep="
@@ -816,7 +693,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     save_checkpoint(os.path.join(save_dir, latest_name),
                     total_updates, actor_state, critic_state, carry.rms,
-                    tail_dim, guide_bonus, policy_mode, reward_weights)
+                    tail_dim, policy_mode, reward_weights,
+                    obs_config, algo)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms
@@ -828,23 +706,16 @@ if __name__ == '__main__':
     _default_save = os.path.join(os.path.dirname(__file__), '..', 'checkpoints')
 
     parser = argparse.ArgumentParser(
-        description='Train guided, feed-forward end-to-end, or recurrent MAPPO')
-    parser.add_argument('--policy-mode', choices=['guided', 'end-to-end', 'end-to-end-memory'],
-                        default='guided', help='Policy architecture and guidance regime; '
-                             'end-to-end-memory uses a GRU actor')
+        description='Train a feed-forward or recurrent end-to-end coverage policy')
+    parser.add_argument('--policy-mode', choices=['end-to-end', 'end-to-end-memory'],
+                        default='end-to-end',
+                        help='end-to-end-memory uses a GRU actor')
     parser.add_argument('--config',   default=_default_cfg,
                         help='Path to YAML config file')
     parser.add_argument('--save-dir', default=_default_save,
                         help='Directory for checkpoints and training log')
     parser.add_argument('--resume',   default=None,
                         help='Checkpoint with matching actor architecture to resume from')
-    parser.add_argument('--guide-bonus', type=float, default=10.0,
-                        help='Reward paid to a robot that enters the cell BOSCO '
-                             'pointed it at. Keep it below the environment\'s '
-                             'alpha (10.0): the waypoint is usually an '
-                             'undiscovered cell, so the two are collected '
-                             'together and a larger bonus would make following '
-                             'the tour worth more than covering the map')
     parser.add_argument('--backend',  default='auto',
                         choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'],
                         help='Force a JAX backend. Default "auto": Metal on Apple '
@@ -863,13 +734,19 @@ if __name__ == '__main__':
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 64 on GPU if config uses <=16)')
     parser.add_argument('--maps', type=int, default=None,
-                        help='Procedural map-bank size for end-to-end modes')
+                        help='Procedural map-bank size')
+    parser.add_argument('--algo', choices=['mappo', 'ippo'], default='mappo',
+                        help='mappo: centralised critic on the global state; '
+                             'ippo: independent critic on the local observation')
+    parser.add_argument('--obs-mode', choices=['legacy', 'memory_comm'], default=None,
+                        help='Actor observation (overrides env.obs_mode). memory_comm: '
+                             'lidar-built per-robot map memory shared within '
+                             'comm_radius')
     parser.add_argument('--additional-updates', type=int, default=None,
                         help='When resuming, run exactly this many extra updates')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
-          args.guide_bonus,
           wandb_overrides={
               'enabled': args.wandb_enabled,
               'project': args.wandb_project,
@@ -879,4 +756,5 @@ if __name__ == '__main__':
               'mode':    args.wandb_mode,
           }, num_humans=args.humans, num_envs=args.envs,
           policy_mode=args.policy_mode, num_maps=args.maps,
-          additional_updates=args.additional_updates)
+          additional_updates=args.additional_updates,
+          obs_mode=args.obs_mode, algo=args.algo)

@@ -10,6 +10,8 @@ Critic (centralised training): a light 2D-CNN reads the per-agent multi-channel
 map [walls, coverage, self, teammates], and the flattened features are
 concatenated with the joint kinematic vector before the value head.
 
+LocalCritic (IPPO): the actor's encoder on the agent's own observation, V(o_i).
+
 Orthogonal initialisers require a QR factorisation, which the Metal backend
 does not implement. Callers should evaluate `init` on CPU and transfer the
 resulting parameters to the accelerator (see `src.utils.jax_device`).
@@ -57,6 +59,26 @@ def _conv(features: int, kernel, strides, padding, gain: float = _RELU_GAIN) -> 
     )
 
 
+def _local_features(obs: jax.Array, vec_dim: int, n_rays: int, tail_dim: int,
+                    lidar_embed: int) -> jax.Array:
+    """Shared local encoder: [vec | lidar | tail] -> [lidar embedding, vec, tail].
+
+    Called from inside a compact module, so the layers it creates belong to
+    the caller (names Conv_0, Conv_1, Dense_0 are unchanged for the actor).
+    """
+    vec   = obs[:, :vec_dim]
+    lidar = obs[:, vec_dim : vec_dim + n_rays]
+    tail  = obs[:, vec_dim + n_rays : vec_dim + n_rays + tail_dim]
+
+    # A lidar scan is a ring, so circular padding keeps the two ends of the
+    # array adjacent and makes the features rotation-equivariant.
+    x = lidar[:, :, None]                                      # (B, n_rays, 1)
+    x = nn.relu(_conv(16, (5,), (2,), 'CIRCULAR')(x))
+    x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
+    x = nn.relu(_dense(lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
+    return jnp.concatenate([x, vec, tail], axis=-1)
+
+
 class Actor(nn.Module):
     """
     Shared-parameter actor, optionally with a per-robot GRU memory.
@@ -84,18 +106,8 @@ class Actor(nn.Module):
             log_std (action_dim,) for feed-forward, (B, action_dim) for recurrent
             memory  (B, hidden_size), recurrent only
         """
-        vec   = obs[:, : self.vec_dim]
-        lidar = obs[:, self.vec_dim : self.vec_dim + self.n_rays]
-        tail  = obs[:, self.vec_dim + self.n_rays : self.vec_dim + self.n_rays + self.tail_dim]
-
-        # A lidar scan is a ring, so circular padding keeps the two ends of the
-        # array adjacent and makes the features rotation-equivariant.
-        x = lidar[:, :, None]                                      # (B, n_rays, 1)
-        x = nn.relu(_conv(16, (5,), (2,), 'CIRCULAR')(x))
-        x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
-        x = nn.relu(_dense(self.lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
-
-        h = jnp.concatenate([x, vec, tail], axis=-1)
+        h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
+                            self.lidar_embed)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
 
@@ -124,8 +136,7 @@ class Critic(nn.Module):
     """
     Centralised critic: V_i(s) from the agent-centred global state.
 
-    The map channels [walls, coverage, self, teammates, my assignment,
-    teammates' assignments] make the estimate
+    The map channels [walls, coverage, self, teammates] make the estimate
     agent-specific, which is what lets each robot get its own advantage while
     the value still sees the whole team.
     """
@@ -142,6 +153,30 @@ class Critic(nn.Module):
         x = nn.relu(_dense(self.map_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
 
         h = jnp.concatenate([x, vec], axis=-1)
+        h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
+        h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
+        return _dense(1, 1.0)(h)
+
+
+class LocalCritic(nn.Module):
+    """
+    Decentralised critic for IPPO: V(o_i) from the agent's own observation.
+
+    Same encoder as the actor but separate parameters, so value regression
+    cannot distort the policy features. Shared across agents like the actor.
+    """
+
+    vec_dim: int = 8
+    n_rays: int = 36
+    tail_dim: int = 0
+    lidar_embed: int = 64
+    hidden_size: int = 256
+
+    @nn.compact
+    def __call__(self, obs: jax.Array) -> jax.Array:
+        """obs : (B, obs_dim) -> value : (B, 1)"""
+        h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
+                            self.lidar_embed)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         return _dense(1, 1.0)(h)

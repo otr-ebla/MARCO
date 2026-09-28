@@ -49,8 +49,6 @@ class VecEnv:
 
         self.reset = jax.jit(self._reset)
         self.step = jax.jit(self._step)
-        self.update_bosco = jax.jit(self._update_bosco)
-        self.update_cell_assignments = jax.jit(self._update_cell_assignments)
         self.update_ghost_robot_prob = jax.jit(self._update_ghost_robot_prob)
 
     @property
@@ -121,7 +119,7 @@ class VecEnv:
         """
 
         def one(s: EnvState, a: jax.Array):
-            s, reward, term, trunc = self.env.step(s, a)
+            s, reward, term, trunc, cover = self.env._step_core(s, a)
             done = term | trunc
 
             # Diagnostics describe the step just taken, like `reward`, so they
@@ -134,12 +132,15 @@ class VecEnv:
             info['robot_positions'] = s.robot_positions
 
             key, reset_key = jax.random.split(s.key)
-            fresh = self.env.reset(reset_key).replace(
-                cell_assignments=s.cell_assignments
-            )
+            fresh = self.env._reset_state(reset_key)
             s = jax.tree_util.tree_map(
                 lambda f, c: _select(done, f, c), fresh, s.replace(key=key)
             )
+            if self.env.use_memory:
+                # One scan per step for both branches: a fresh episode starts
+                # with an empty memory and an uncovered spawn cell, exactly
+                # as `env.reset` would produce.
+                s = self.env._refresh_memory(s, cover & ~done)
 
             return (s, self.env.get_obs(s), reward, term, done,
                     info, self.env.get_global_state(s))
@@ -150,16 +151,3 @@ class VecEnv:
         def one(s: EnvState, p: jax.Array):
             return self.env.set_ghost_robot_prob(s, p)
         return jax.vmap(one)(state, probs)
-
-    def _update_bosco(self, state: EnvState, targets: jax.Array):
-        """Returns updated (state, obs, gstate) from new bosco targets (E, N, 2)"""
-        def one(s: EnvState, t: jax.Array):
-            s_new = self.env.set_bosco_targets(s, t)
-            return s_new, self.env.get_obs(s_new), self.env.get_global_state(s_new)
-        return jax.vmap(one)(state, targets)
-
-    def _update_cell_assignments(self, state: EnvState, assignments: jax.Array):
-        def one(s: EnvState, a: jax.Array):
-            s_new = self.env.set_cell_assignments(s, a)
-            return s_new, self.env.get_obs(s_new), self.env.get_global_state(s_new)
-        return jax.vmap(one)(state, assignments)

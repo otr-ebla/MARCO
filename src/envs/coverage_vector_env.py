@@ -19,23 +19,24 @@ from .map_layouts import ProceduralMapLayout, create_map_bank
 
 _TWO_PI = 2.0 * np.pi
 _BIG = 1.0e9
+_FAR = 1.0e6   # geodesic distance of a cell that cannot reach any target
 
 # Training defaults; checkpoints persist this complete reward specification.
+# 'local_coverage_v1' is kept only so older checkpoints still evaluate.
 E2E_REWARD_DEFAULTS = {
-    'reward_mode': 'local_coverage_v1',
-    'alpha': 10.0,
-    'beta': 2.0,  # per entry into a previously covered cell
+    'reward_mode': 'progress',
+    'alpha': 10.0,                  # per newly covered cell
+    'coverage_reward_growth': 2.0,  # late cells are worth up to 3x alpha
+    'progress_weight': 2.0,         # per cell of geodesic progress towards work
+    'loiter_cost': 1.0,             # per step without discovery or progress
+    'spread_weight': 0.2,           # per step and teammate at zero distance
+    'spread_radius': 2.5,           # metres; keep <= comm_radius to stay observable
     'tau': 0.02,
     'wall_kappa': 2.0,
     'kappa': 5.0,
     'human_kappa': 10.0,
     'completion_bonus': 200.0,
-    'coverage_reward_growth': 2.0,
-    'room_completion_bonus': 0.0,
-    'psi': 0.0,
-    'velocity_cost': 0.0,
-    'angular_cost': 0.0,
-    'action_smoothness_cost': 0.0,
+    'completion_time_bonus': 1.0,   # instant completion pays (1 + this) x bonus
 }
 
 
@@ -48,8 +49,6 @@ class EnvState:
     human_positions:  jax.Array   # (M, 2)   float32
     human_headings:   jax.Array   # (M,)     float32
     human_dists:      jax.Array   # (M,)     float32
-    bosco_targets:    jax.Array   # (N, 2)   float32  — target coordinates for BOSCO
-    cell_assignments: jax.Array   # (N, H, W) float32  — BOSCO ownership, one-hot
     coverage_grid:    jax.Array   # (H, W)   float32  — 0.0 / 1.0
     room_completed:   jax.Array   # (R,)     bool
     robot_alive:      jax.Array   # (N,)     bool
@@ -60,6 +59,13 @@ class EnvState:
     robot_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
     human_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
     ghost_robot_prob: jax.Array   # ()       float32 — humans ignore robots with this probability
+    # Decentralised per-robot memory ('memory_comm' obs mode; zeros otherwise).
+    # Dense bitmaps are the jit/vmap-friendly form of a sparse cell dictionary.
+    # Occupancy is not stored: a known cell's label is the static ground truth,
+    # so occupied = mem_known & wall.
+    mem_known:        jax.Array   # (N, H, W) float32 — 0.0 / 1.0, observed by lidar or shared
+    mem_covered:      jax.Array   # (N, H, W) float32 — 0.0 / 1.0, covered as far as robot i knows
+    lidar:            jax.Array   # (N, R)    float32 — latest normalised scan
 
 
 @struct.dataclass
@@ -69,8 +75,6 @@ class GlobalState:
     occupancy:       jax.Array   # (N, H, W)  float32, one-hot per robot
     kinematics:      jax.Array   # (N, 6)     float32, normalised
     human_positions: jax.Array   # (M, 2)     float32, normalised
-    bosco_targets:   jax.Array   # (N, 2)     float32, normalised
-    cell_assignments: jax.Array  # (N, H, W)  float32, BOSCO ownership
     map_id:          jax.Array   # ()         int32
 
 
@@ -93,28 +97,30 @@ class MultiRobotCoverageEnv:
         self.v_max           = float(cfg.get('v_max',           1.0))
         self.omega_max       = float(cfg.get('omega_max',       1.0))
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
-        self.actor_bosco_guidance = bool(cfg.get('actor_bosco_guidance', True))
-        self.bosco_reward_guidance = bool(cfg.get('bosco_reward_guidance', True))
         self.reward_mode = cfg.get('reward_mode', 'legacy')
-        if self.reward_mode not in ('legacy', 'local_coverage_v1'):
+        if self.reward_mode not in ('legacy', 'local_coverage_v1', 'progress'):
             raise ValueError(f'Unknown reward_mode: {self.reward_mode}')
-        if self.reward_mode == 'local_coverage_v1' and (
-            self.actor_bosco_guidance or self.bosco_reward_guidance
-        ):
-            raise ValueError('local_coverage_v1 requires an unguided end-to-end policy')
         self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
         self.local_coverage_size = int(cfg.get('local_coverage_size', 5))
         if self.local_coverage_size <= 0 or self.local_coverage_size % 2 == 0:
             raise ValueError("local_coverage_size must be a positive odd integer")
 
+        # 'legacy': velocity / teammates / lidar / coverage patch.
+        # 'memory_comm': per-robot lidar-built map memory, merged (OR) with
+        # teammates inside comm_radius; see _get_memory_obs for the layout.
+        self.obs_mode = cfg.get('obs_mode', 'legacy')
+        if self.obs_mode not in ('legacy', 'memory_comm'):
+            raise ValueError(f'Unknown obs_mode: {self.obs_mode}')
+        self.use_memory = self.obs_mode == 'memory_comm'
+        self.comm_radius = float(cfg.get('comm_radius', 3.0))
+        self.comm_slots = int(cfg.get('comm_slots', max(self.num_robots - 1, 0)))
+        if self.comm_radius < 0.0 or self.comm_slots < 0:
+            raise ValueError('comm_radius and comm_slots must be non-negative')
+
         # -- Reward weights --
         self.alpha       = float(cfg.get('alpha',       10.0))
         self.coverage_reward_growth = float(
             cfg.get('coverage_reward_growth', 2.0)
-        )
-        self.bosco_gamma = float(cfg.get('bosco_gamma', 10.0))
-        self.bosco_distance_penalty = float(
-            cfg.get('bosco_distance_penalty', 1.0)
         )
         self.beta        = float(cfg.get('beta',         0.5))
         self.kappa       = float(cfg.get('kappa',        5.0))
@@ -127,11 +133,16 @@ class MultiRobotCoverageEnv:
         self.action_smoothness_cost = float(
             cfg.get('action_smoothness_cost', 0.01)
         )
+        self.progress_weight = float(cfg.get('progress_weight', 2.0))
+        self.loiter_cost = float(cfg.get('loiter_cost', 1.0))
+        self.spread_weight = float(cfg.get('spread_weight', 0.2))
+        self.spread_radius = float(cfg.get('spread_radius', 2.5))
+        self.completion_time_bonus = float(cfg.get('completion_time_bonus', 1.0))
+        if self.spread_radius <= 0.0:
+            raise ValueError('spread_radius must be positive')
         weights = {
             'alpha': self.alpha,
             'coverage_reward_growth': self.coverage_reward_growth,
-            'bosco_gamma': self.bosco_gamma,
-            'bosco_distance_penalty': self.bosco_distance_penalty,
             'beta': self.beta,
             'kappa': self.kappa,
             'wall_kappa': self.wall_kappa,
@@ -141,6 +152,10 @@ class MultiRobotCoverageEnv:
             'velocity_cost': self.velocity_cost,
             'angular_cost': self.angular_cost,
             'action_smoothness_cost': self.action_smoothness_cost,
+            'progress_weight': self.progress_weight,
+            'loiter_cost': self.loiter_cost,
+            'spread_weight': self.spread_weight,
+            'completion_time_bonus': self.completion_time_bonus,
         }
         negative = [name for name, value in weights.items() if value < 0.0]
         if negative:
@@ -194,15 +209,21 @@ class MultiRobotCoverageEnv:
         self.room_totals = jnp.sum(self.room_masks, axis=(2, 3))     # (M, 1)
 
         # -- Derived dims --
-        self.obs_vec_dim   = 2 + 2 * int(self.actor_bosco_guidance) + self.k_teammates * 2
-        self.patch_dim     = (
-            self.local_coverage_size ** 2 if self.use_local_coverage_obs else 0
-        )
+        if self.use_memory:
+            # pose (x, y, cos, sin) + (v, omega) + own id + (id, dx, dy) per slot
+            self.obs_vec_dim = 4 + 2 + 1 + 3 * self.comm_slots
+            # [occupied, covered, known] crop from the robot's memory
+            self.patch_dim   = 3 * self.local_coverage_size ** 2
+        else:
+            self.obs_vec_dim = 2 + self.k_teammates * 2
+            self.patch_dim   = (
+                self.local_coverage_size ** 2 if self.use_local_coverage_obs else 0
+            )
         self.norm_dim      = self.obs_vec_dim + self.n_rays
         self.obs_dim       = self.norm_dim + self.patch_dim
         self.action_dim    = 2
-        self.critic_channels = 6
-        self.critic_vec_dim  = 6 + 6 * self.num_robots + 2 * self.num_humans + 2 * self.num_robots
+        self.critic_channels = 4
+        self.critic_vec_dim  = 6 + 6 * self.num_robots + 2 * self.num_humans
         self._ray_angles = jnp.asarray(
             np.linspace(0.0, _TWO_PI, self.n_rays, endpoint=False, dtype=np.float32)
         )
@@ -213,6 +234,17 @@ class MultiRobotCoverageEnv:
         patch_x, patch_y = np.meshgrid(patch_axis, patch_axis)
         self._local_patch_offsets = jnp.asarray(
             np.stack([patch_x, patch_y], axis=-1)
+        )
+        # Grid-aligned crop: integer cell offsets around the robot's own cell.
+        self._crop_offsets = jnp.arange(
+            self.local_coverage_size, dtype=jnp.int32
+        ) - self.local_coverage_size // 2
+        # Lidar cell marking: samples every half cell along each ray, so no
+        # cell crossed by a beam is skipped.
+        ray_step = 0.5 * self.cell_size
+        self._ray_samples = jnp.asarray(
+            np.arange(int(np.ceil(self.max_lidar_range / ray_step)) + 1,
+                      dtype=np.float32) * ray_step
         )
 
         # -- Spawn candidates --
@@ -234,6 +266,14 @@ class MultiRobotCoverageEnv:
         self._num_candidates   = max_cands
         self._spawn_clearance = 2.0 * self.robot_radius + 0.05
         self._spawn_needs_greedy = self.cell_size < self._spawn_clearance
+
+        # Progress potential: own cell plus its 4-neighbours, whose distance
+        # values are blended with the sub-cell offset so the potential moves
+        # continuously while crossing a cell instead of jumping at borders.
+        self._nb_dr = jnp.array([0, 1, -1, 0, 0], jnp.int32)
+        self._nb_dc = jnp.array([0, 0, 0, 1, -1], jnp.int32)
+        # Cells gained per step when driving straight at v_max.
+        self._full_progress = max(self.v_max * self.dt / self.cell_size, 1e-6)
 
         self._k_eff = min(self.k_teammates, max(self.num_robots - 1, 0))
         self._m_eff = min(self.m_humans, self.num_humans)
@@ -319,6 +359,55 @@ class MultiRobotCoverageEnv:
         col = jnp.clip(jnp.floor(pos[:, 0] / self.cell_size), 0, self.grid_w - 1)
         row = jnp.clip(jnp.floor(pos[:, 1] / self.cell_size), 0, self.grid_h - 1)
         return col.astype(jnp.int32), row.astype(jnp.int32)
+
+    def _geodesic_distance(self, targets: jax.Array, free: jax.Array) -> jax.Array:
+        """Multi-source 4-connected distance, in cells, from every free cell to
+        the nearest target cell. Cells that reach no target hold `_FAR`.
+
+        targets, free : (..., H, W) bool
+        """
+        far = jnp.float32(_FAR)
+        lead = [(0, 0)] * (free.ndim - 2)
+
+        def relax(d):
+            pad = jnp.pad(d, lead + [(1, 1), (1, 1)], constant_values=far)
+            nb = jnp.minimum(
+                jnp.minimum(pad[..., :-2, 1:-1], pad[..., 2:, 1:-1]),
+                jnp.minimum(pad[..., 1:-1, :-2], pad[..., 1:-1, 2:]),
+            )
+            return jnp.where(free, jnp.minimum(d, nb + 1.0), far)
+
+        def cond(carry):
+            _, changed, it = carry
+            return changed & (it < self.num_cells)
+
+        def body(carry):
+            d, _, it = carry
+            nd = relax(d)
+            return nd, jnp.any(nd != d), it + 1
+
+        d0 = jnp.where(targets & free, 0.0, far).astype(jnp.float32)
+        d, _, _ = jax.lax.while_loop(cond, body, (d0, jnp.bool_(True), jnp.int32(0)))
+        return d
+
+    def _work_distance(self, dist: jax.Array, pos: jax.Array) -> jax.Array:
+        """Continuous distance, in cells, from each robot to its nearest target.
+
+        dist : (N, H, W) per-robot geodesic field; pos : (N, 2) metres.
+        The value is min over the own cell and its 4-neighbours c of
+        dist[c] + |pos - centre(c)| / cell_size, so it decreases smoothly as
+        the robot drives towards a neighbour lying on a shorter path.
+        """
+        col, row = self._pos_to_cell(pos)
+        r = row[:, None] + self._nb_dr[None, :]
+        c = col[:, None] + self._nb_dc[None, :]
+        inside = (r >= 0) & (r < self.grid_h) & (c >= 0) & (c < self.grid_w)
+        r = jnp.clip(r, 0, self.grid_h - 1)
+        c = jnp.clip(c, 0, self.grid_w - 1)
+        d = jnp.where(inside, dist[self._robot_ids[:, None], r, c], _FAR)
+        centre = (jnp.stack([c, r], axis=-1).astype(jnp.float32) + 0.5) * self.cell_size
+        offset = jnp.linalg.norm(pos[:, None, :] - centre, axis=-1) / self.cell_size
+        return jnp.min(d + offset, axis=1)
 
     def _diff_drive(
         self, pos: jax.Array, heading: jax.Array, v: jax.Array, omega: jax.Array
@@ -411,6 +500,59 @@ class MultiRobotCoverageEnv:
             self._cast_lidar_single, in_axes=(0, 0, None, 0, None, None, None)
         )(state.robot_positions, state.robot_headings, state.robot_positions, not_self, state.map_id, state.human_positions, state.human_headings)
 
+    def _refresh_memory(self, state: EnvState, cover_mask: jax.Array) -> EnvState:
+        """Scan, mark observed/covered cells, then exchange maps within comm range.
+
+        cover_mask : (N,) bool — robot i covered the cell it now stands on.
+        """
+        n = self.num_robots
+        ids = self._robot_ids
+        pos = state.robot_positions
+        alive = state.robot_alive
+        lidar = self._cast_lidar_all(state)                          # (N, R)
+
+        # Every sample strictly before the first hit is a seen cell, plus the
+        # cell just behind the hit point (the obstacle's own cell). Labels are
+        # static ground truth, so marking "known" is all the memory needs.
+        dist = lidar * self.max_lidar_range
+        ts = jnp.broadcast_to(self._ray_samples, (*dist.shape, self._ray_samples.shape[0]))
+        ts = jnp.concatenate([ts, dist[..., None] + 1e-3], axis=-1)  # (N, R, K+1)
+        valid = jnp.concatenate(
+            [ts[..., :-1] < dist[..., None], (lidar < 1.0)[..., None]], axis=-1
+        )
+        angles = state.robot_headings[:, None] + self._ray_angles[None, :]
+        px = pos[:, None, None, 0] + ts * jnp.cos(angles)[..., None]
+        py = pos[:, None, None, 1] + ts * jnp.sin(angles)[..., None]
+        cols = jnp.floor(px / self.cell_size).astype(jnp.int32)
+        rows = jnp.floor(py / self.cell_size).astype(jnp.int32)
+        valid = (valid & (cols >= 0) & (cols < self.grid_w)
+                 & (rows >= 0) & (rows < self.grid_h) & alive[:, None, None])
+        flat = (jnp.clip(rows, 0, self.grid_h - 1) * self.grid_w
+                + jnp.clip(cols, 0, self.grid_w - 1)).reshape(n, -1)
+        known = state.mem_known.reshape(n, -1).at[ids[:, None], flat].max(
+            valid.reshape(n, -1).astype(jnp.float32)
+        )
+
+        own_c, own_r = self._pos_to_cell(pos)
+        covered = state.mem_covered.reshape(n, -1).at[ids, own_r * self.grid_w + own_c].max(
+            cover_mask.astype(jnp.float32)
+        )
+
+        # Single-hop exchange: OR over direct neighbours (and self). Multi-hop
+        # spread still happens over successive steps.
+        in_range = self._pairwise_sq_dist(pos) <= self.comm_radius ** 2
+        adj = (in_range & alive[:, None] & alive[None, :]) | jnp.eye(n, dtype=bool)
+        adj = adj.astype(jnp.float32)
+        known = jnp.minimum(adj @ known, 1.0)
+        covered = jnp.minimum(adj @ covered, 1.0)
+
+        shape = (n, self.grid_h, self.grid_w)
+        return state.replace(
+            mem_known=known.reshape(shape),
+            mem_covered=covered.reshape(shape),
+            lidar=lidar,
+        )
+
     def _sample_spawns(self, key: jax.Array, map_id: jax.Array, num_spawns: int) -> jax.Array:
         cands = self._spawn_candidates[map_id]
         if not self._spawn_needs_greedy:
@@ -435,6 +577,30 @@ class MultiRobotCoverageEnv:
         return chosen
 
     def reset(self, key: jax.Array, map_id: jax.Array | None = None) -> EnvState:
+        state = self._reset_state(key, map_id)
+        if self.use_memory:
+            # The spawn cell is not covered, matching the global coverage grid.
+            state = self._refresh_memory(
+                state, jnp.zeros((self.num_robots,), bool)
+            )
+        return state
+
+    def step(
+        self, state: EnvState, joint_actions: jax.Array
+    ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array]:
+        state, rewards, terminated, truncated, cover = self._step_core(
+            state, joint_actions
+        )
+        if self.use_memory:
+            state = self._refresh_memory(state, cover)
+        return state, rewards, terminated, truncated
+
+    # `_reset_state` / `_step_core` leave the memory and lidar untouched so
+    # VecEnv can auto-reset first and then scan once per step: under vmap a
+    # scanning reset would be evaluated for every env on every step, doubling
+    # the dominant lidar cost.
+
+    def _reset_state(self, key: jax.Array, map_id: jax.Array | None = None) -> EnvState:
         key, map_key, spawn_key, r_hdg_key, h_hdg_key, h_dist_key = jax.random.split(key, 6)
         if map_id is None:
             map_id = jax.random.randint(map_key, (), 0, self.num_maps)
@@ -460,10 +626,6 @@ class MultiRobotCoverageEnv:
             human_dists      = jax.random.uniform(
                 h_dist_key, (self.num_humans,), minval=0.5, maxval=5.0
             ),
-            bosco_targets    = robot_positions,  # initialize target to current pos
-            cell_assignments = jnp.zeros(
-                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
-            ),
             coverage_grid    = jnp.zeros((self.grid_h, self.grid_w), jnp.float32),
             room_completed   = jnp.zeros((self.num_rooms,), bool),
             robot_alive      = jnp.ones((self.num_robots,), bool),
@@ -476,11 +638,20 @@ class MultiRobotCoverageEnv:
             # Evaluation is safe by default: humans always react to robots.
             # Training explicitly overrides this value with its curriculum.
             ghost_robot_prob = jnp.float32(0.0),
+            mem_known        = jnp.zeros(
+                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
+            ),
+            mem_covered      = jnp.zeros(
+                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
+            ),
+            lidar            = jnp.zeros((self.num_robots, self.n_rays), jnp.float32),
         )
 
-    def step(
+    def _step_core(
         self, state: EnvState, joint_actions: jax.Array
-    ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Physics, coverage and reward; the last output is the (N,) bool mask
+        of robots that covered their current cell, for `_refresh_memory`."""
         alive     = state.robot_alive
         v_cmds    = (joint_actions[:, 0] + 1.0) * 0.5 * self.v_max
         omega_cmds = joint_actions[:, 1] * self.omega_max
@@ -572,12 +743,6 @@ class MultiRobotCoverageEnv:
             jnp.where(eligible, ids + 1, 0)
         )
         discovered = eligible & (claim[flat] == ids + 1)
-        assigned_discovery = discovered & (
-            state.cell_assignments[ids, rows, cols] > 0.5
-        )
-        if not self.bosco_reward_guidance:
-            assigned_discovery = discovered
-        unassigned_discovery = discovered & ~assigned_discovery
         redundant  = moved & ~discovered
         travelled = jnp.linalg.norm(new_pos - state.robot_positions, axis=-1)
         nominal_step = max(self.v_max * self.dt, 1e-6)
@@ -616,20 +781,6 @@ class MultiRobotCoverageEnv:
         pen      = self.psi * (1.0 - dist / self._safe_dist) * (dist < self._safe_dist)
         prox_pen = jnp.sum(pen, axis=1) * alive
 
-        dist_to_bosco_prev = jnp.sqrt(jnp.sum((state.robot_positions - state.bosco_targets)**2, axis=-1))
-        dist_to_bosco_next = jnp.sqrt(jnp.sum((new_pos - state.bosco_targets)**2, axis=-1))
-        bosco_reward_term = self.bosco_gamma * (dist_to_bosco_prev - dist_to_bosco_next)
-        bosco_active = jnp.any(state.cell_assignments > 0.5, axis=(1, 2))
-        bosco_distance_cost = (
-            self.bosco_distance_penalty
-            * (dist_to_bosco_next / self.cell_size) ** 2
-            * bosco_active
-        )
-
-        if not self.bosco_reward_guidance:
-            bosco_reward_term = jnp.zeros_like(bosco_reward_term)
-            bosco_distance_cost = jnp.zeros_like(bosco_distance_cost)
-
         v_norm = v_cmds / self.v_max
         omega_norm = omega_cmds / self.omega_max
         prev_v_norm = state.robot_velocities[:, 0] / self.v_max
@@ -642,22 +793,25 @@ class MultiRobotCoverageEnv:
                + (omega_norm - prev_omega_norm) ** 2)
         )
 
-        rewards = jnp.where(
-            alive,
-            self.alpha * discovery_multiplier * assigned_discovery
-            + (self.alpha * 0.25) * discovery_multiplier * unassigned_discovery
-            - self.beta * redundant_travel
-            - self.tau
-            - self.wall_kappa * wall_hit
-            - self.kappa * robot_hit
-            - self.human_kappa * robot_hit_human
-            - prox_pen
-            + team_bonus
-            + bosco_reward_term
-            - bosco_distance_cost
-            - control_cost,
-            0.0,
-        ).astype(jnp.float32)
+        if self.reward_mode == 'progress':
+            rewards = self._progress_reward(
+                state, new_pos, prev_grid, discovered, discovery_multiplier,
+                wall_hit, robot_hit, robot_hit_human, complete,
+            )
+        else:
+            rewards = jnp.where(
+                alive,
+                self.alpha * discovery_multiplier * discovered
+                - self.beta * redundant_travel
+                - self.tau
+                - self.wall_kappa * wall_hit
+                - self.kappa * robot_hit
+                - self.human_kappa * robot_hit_human
+                - prox_pen
+                + team_bonus
+                - control_cost,
+                0.0,
+            ).astype(jnp.float32)
 
         step_count = state.step_count + 1
         truncated  = step_count >= self.max_steps
@@ -679,36 +833,139 @@ class MultiRobotCoverageEnv:
             robot_hits       = robot_hit.astype(jnp.float32),
             human_hits       = robot_hit_human.astype(jnp.float32),
         )
-        return next_state, rewards, terminated, truncated
+        return next_state, rewards, terminated, truncated, moved & coverable
+
+    def _progress_reward(
+        self, state: EnvState, new_pos: jax.Array, prev_grid: jax.Array,
+        discovered: jax.Array, discovery_multiplier: jax.Array,
+        wall_hit: jax.Array, robot_hit: jax.Array, robot_hit_human: jax.Array,
+        complete: jax.Array,
+    ) -> jax.Array:
+        """Per-robot reward for reward_mode='progress', shape (N,).
+
+        discovery   alpha * (1 + growth * coverage) per newly covered cell.
+        progress    progress_weight per cell of geodesic approach to the
+                    nearest cell the robot believes uncovered. The belief is
+                    its own memory (own coverage + what teammates shared in
+                    comm range), so the implicit target uses only knowledge
+                    the robot has. Transit over covered cells towards
+                    remaining work is therefore paid, not punished.
+        loiter      loiter_cost per step without discovery, scaled by the
+                    missing fraction of full-speed progress: parking,
+                    spinning and wandering over covered cells cost the full
+                    amount, driving straight at v_max towards work costs 0.
+        spread      spread_weight * max(0, 1 - d / spread_radius) per teammate,
+                    a constant pressure to keep the team apart.
+        completion  shared bonus when the map is covered, larger when early.
+
+        Both potentials of a step use the same pre-step field, so covering the
+        last cell of an area does not look like a sudden loss of progress, and
+        the progress term telescopes: closed loops earn exactly zero.
+        """
+        alive = state.robot_alive
+        free = self.free_masks[state.map_id] > 0.5                       # (H, W)
+        if self.use_memory:
+            believed = state.mem_covered > 0.5                            # (N, H, W)
+        else:
+            believed = jnp.broadcast_to(prev_grid > 0.5, (self.num_robots, *free.shape))
+        targets = free[None] & ~believed
+        dist = self._geodesic_distance(targets, jnp.broadcast_to(free, targets.shape))
+
+        before = self._work_distance(dist, state.robot_positions)
+        after = self._work_distance(dist, new_pos)
+        progress = jnp.where(before < 0.5 * _FAR, before - after, 0.0)
+
+        idle = jnp.clip(1.0 - progress / self._full_progress, 0.0, 1.0)
+        loiter = self.loiter_cost * idle * ~discovered
+
+        d = jnp.sqrt(self._pairwise_sq_dist(new_pos))
+        crowd = jnp.maximum(0.0, 1.0 - d / self.spread_radius) * alive[None, :]
+        spread = self.spread_weight * jnp.sum(crowd, axis=1)
+
+        time_left = jnp.maximum(1.0 - (state.step_count + 1) / self.max_steps, 0.0)
+        completion = (self.completion_bonus * complete
+                      * (1.0 + self.completion_time_bonus * time_left))
+
+        reward = (
+            self.alpha * discovery_multiplier * discovered
+            + self.progress_weight * progress
+            - loiter
+            - spread
+            - self.tau
+            - self.wall_kappa * wall_hit
+            - self.kappa * robot_hit
+            - self.human_kappa * robot_hit_human
+            + completion
+        )
+        return jnp.where(alive, reward, 0.0).astype(jnp.float32)
 
     def set_ghost_robot_prob(self, state: EnvState, prob: jax.Array) -> EnvState:
         return state.replace(ghost_robot_prob=jnp.clip(prob, 0.0, 1.0))
 
-    def set_bosco_targets(self, state: EnvState, bosco_targets: jax.Array) -> EnvState:
-        """Update BOSCO targets. bosco_targets: (N, 2)"""
-        return state.replace(bosco_targets=bosco_targets)
+    def _get_memory_obs(self, state: EnvState) -> jax.Array:
+        """Per-robot observation for obs_mode='memory_comm', shape (N, obs_dim).
 
-    def set_cell_assignments(
-        self, state: EnvState, cell_assignments: jax.Array
-    ) -> EnvState:
-        """Attach BOSCO's per-robot cell partition to environment and critic state."""
-        return state.replace(cell_assignments=cell_assignments.astype(jnp.float32))
+        [ x/W, y/H, cos(h), sin(h)                      pose, 4
+          v/v_max, omega/omega_max                      velocity, 2
+          id                                            own id in 1..N, 1
+          (id_j, dx_j, dy_j) x comm_slots               nearest teammates in comm
+                                                        range, world-frame metres;
+                                                        id 0 marks an empty slot
+          lidar                                         n_rays, normalised
+          occupied | covered | known                    3 x S x S memory crop,
+                                                        grid-aligned, rows = +y ]
+        Cells outside the map read as known and occupied.
+        """
+        n = self.num_robots
+        ids = self._robot_ids
+        pos = state.robot_positions
+        alive = state.robot_alive
+
+        pose = jnp.stack([
+            pos[:, 0] / self.map_layout.width,
+            pos[:, 1] / self.map_layout.height,
+            jnp.cos(state.robot_headings),
+            jnp.sin(state.robot_headings),
+        ], axis=-1)
+        vel = state.robot_velocities / jnp.array([self.v_max, self.omega_max])
+        parts = [pose, vel, (ids + 1).astype(jnp.float32)[:, None]]
+
+        k = min(self.comm_slots, n - 1)
+        if k > 0:
+            d2 = self._pairwise_sq_dist(pos)
+            in_range = (d2 <= self.comm_radius ** 2) & alive[:, None] & alive[None, :]
+            neg_d2, idx = jax.lax.top_k(-jnp.where(in_range, d2, _BIG), k)
+            valid = (-neg_d2 < _BIG).astype(jnp.float32)[..., None]
+            rel = pos[idx] - pos[:, None, :]                          # (N, k, 2)
+            slot = jnp.concatenate([(idx + 1).astype(jnp.float32)[..., None], rel], axis=-1)
+            parts.append((slot * valid).reshape(n, 3 * k))
+        if self.comm_slots > k:
+            parts.append(jnp.zeros((n, 3 * (self.comm_slots - k)), jnp.float32))
+
+        parts.append(state.lidar)
+
+        cols, rows = self._pos_to_cell(pos)
+        r = rows[:, None, None] + self._crop_offsets[None, :, None]  # (N, S, 1)
+        c = cols[:, None, None] + self._crop_offsets[None, None, :]  # (N, 1, S)
+        inside = (r >= 0) & (r < self.grid_h) & (c >= 0) & (c < self.grid_w)
+        r = jnp.clip(r, 0, self.grid_h - 1)
+        c = jnp.clip(c, 0, self.grid_w - 1)
+        i = ids[:, None, None]
+        known = state.mem_known[i, r, c]
+        covered = jnp.where(inside, state.mem_covered[i, r, c], 0.0)
+        occupied = jnp.where(inside, known * self.wall_grids[state.map_id][r, c], 1.0)
+        known = jnp.where(inside, known, 1.0)
+        crop = jnp.stack([occupied, covered, known], axis=1)         # (N, 3, S, S)
+        parts.append(crop.reshape(n, self.patch_dim))
+
+        return jnp.concatenate(parts, axis=1).astype(jnp.float32)
 
     def get_obs(self, state: EnvState) -> jax.Array:
+        if self.use_memory:
+            return self._get_memory_obs(state)
         n     = self.num_robots
-        
-        # BOSCO target in local frame
-        global_dx = state.bosco_targets[:, 0] - state.robot_positions[:, 0]
-        global_dy = state.bosco_targets[:, 1] - state.robot_positions[:, 1]
-        c = jnp.cos(state.robot_headings)
-        s = jnp.sin(state.robot_headings)
-        local_dx = global_dx * c + global_dy * s
-        local_dy = -global_dx * s + global_dy * c
-        bosco_delta = jnp.stack([local_dx, local_dy], axis=-1)
-        
+
         parts = [state.robot_velocities]
-        if self.actor_bosco_guidance:
-            parts.append(bosco_delta)
 
         rel = state.robot_positions[None, :, :] - state.robot_positions[:, None, :]
         if self._k_eff > 0:
@@ -760,15 +1017,12 @@ class MultiRobotCoverageEnv:
         ], axis=-1)
 
         human_norm = state.human_positions / jnp.array([self.map_layout.width, self.map_layout.height])
-        bosco_norm = state.bosco_targets / jnp.array([self.map_layout.width, self.map_layout.height])
 
         return GlobalState(
             coverage=state.coverage_grid, 
             occupancy=occupancy, 
             kinematics=kinematics, 
             human_positions=human_norm,
-            bosco_targets=bosco_norm,
-            cell_assignments=state.cell_assignments,
             map_id=state.map_id
         )
 
@@ -777,25 +1031,19 @@ class MultiRobotCoverageEnv:
         me   = occ[..., :, None, :, :]
         rest = (occ.sum(axis=-3, keepdims=True) - occ)[..., :, None, :, :]
         cov  = jnp.broadcast_to(gs.coverage[..., None, None, :, :], me.shape)
-        mine = gs.cell_assignments[..., :, None, :, :]
-        others = (
-            gs.cell_assignments.sum(axis=-3, keepdims=True)
-            - gs.cell_assignments
-        )[..., :, None, :, :]
         
         # Broadcast the specific map's wall grid along all batch dimensions
         wall = self.wall_grids[gs.map_id]                           # (..., H, W)
         wall = jnp.expand_dims(wall, axis=(-3, -4))                 # (..., 1, 1, H, W)
         wall = jnp.broadcast_to(wall, me.shape)                     # (..., N, 1, H, W)
         
-        grid = jnp.concatenate([wall, cov, me, rest, mine, others], axis=-3)
+        grid = jnp.concatenate([wall, cov, me, rest], axis=-3)
 
         joint = gs.kinematics.reshape(*gs.kinematics.shape[:-2], 1, -1)
         
         flat_humans = gs.human_positions.reshape(*gs.human_positions.shape[:-2], 1, -1)
-        flat_bosco = gs.bosco_targets.reshape(*gs.bosco_targets.shape[:-2], 1, -1)
-        
-        joint_ext = jnp.concatenate([joint, flat_humans, flat_bosco], axis=-1)
+
+        joint_ext = jnp.concatenate([joint, flat_humans], axis=-1)
 
         vec = jnp.concatenate(
             [gs.kinematics, jnp.broadcast_to(joint_ext, (*gs.kinematics.shape[:-1], joint_ext.shape[-1]))],

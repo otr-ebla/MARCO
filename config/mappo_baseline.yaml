@@ -1,7 +1,7 @@
 env:
   num_robots: 3
-  # Guided BOSCO uses this single layout. End-to-end modes override it with
-  # e2e_num_maps below and bypass the planner entirely.
+  # Overridden by e2e_num_maps in training; kept for tools that build a
+  # standalone environment from this section.
   num_maps: 1
   map_seed: 0            # deterministic procedural bank; change for held-out maps
   num_humans: 0          # no dynamic obstacles in this baseline
@@ -30,10 +30,16 @@ env:
   # breaking decentralised execution — this is the key driver of efficient coverage
   use_local_coverage_obs: true
   local_coverage_size: 5    # 5×5 = 25 binary cells centred on the robot
+  # Actor observation. "legacy": velocity + teammates + lidar + coverage patch.
+  # "memory_comm": each robot builds its own map from lidar
+  # (known / occupied / covered) and ORs it with teammates within comm_radius;
+  # obs = pose, velocity, id, (id, dx, dy) per comm slot, lidar, 3×5×5 crop.
+  obs_mode: legacy
+  comm_radius: 3.0       # metres; single-hop map exchange per step
+  comm_slots: 2          # teammate (id, dx, dy) slots, id 0 = empty
   # reward weights — difference reward: alpha, beta, kappa and psi are charged to
   # the individual robot, the two completion bonuses are the only shared terms
-  # A discovery in the robot's BOSCO-assigned region earns alpha; discovering
-  # a new cell assigned to another robot (or not assigned) earns alpha / 4.
+  # Every newly covered cell earns alpha.
   alpha: 10.0
   # Linear growth of the new-cell reward with global coverage:
   # multiplier = 1 + coverage_reward_growth * coverage_ratio.
@@ -59,12 +65,6 @@ env:
   # fires when robots are within safe_dist_factor × robot_radius of each other
   psi: 2.0               # proximity penalty weight
   safe_dist_factor: 3.0  # 0.60 m centre distance: 0.20 m clearance at contact
-  # Dense progress towards the current BOSCO waypoint. With a maximum 0.1 m
-  # move per step this contributes at most about +0.5 per step.
-  bosco_gamma: 10.0
-  # Quadratic MARL penalty for straying from the BOSCO waypoint. Distance is
-  # measured in cells: cost = weight * (distance / cell_size)^2.
-  bosco_distance_penalty: 1.0
   # room completion bonus: fires once per room when coverage ≥ threshold
   # teaches robots to finish a room before moving to the next one
   room_completion_bonus: 50.0
@@ -121,24 +121,28 @@ wandb:
   # later with `wandb sync`, or "disabled" to keep the calls as no-ops.
   mode: online
 
-# Procedural map bank used by both end-to-end policy modes. Each environment
-# samples a map independently at reset; guided BOSCO still uses env.num_maps.
+# Procedural map bank used in training. Each environment samples a map
+# independently at reset.
 e2e_num_maps: 64
 
-# Applied only by train_bosco end-to-end policy modes.
-# beta is charged per covered-cell entry, not per moving timestep.
+# Reward used by src.train_marl. Layout-agnostic: every
+# term uses only the robot's own knowledge (its memory in memory_comm mode).
+# Per step at v_max a robot gains 0.2 cells, so reference magnitudes are:
+#   discovery      ~ +2.0/step (10 per cell, one cell every ~5 steps)
+#   transit        +0.4/step progress, 0 loiter  (driving straight to work)
+#   park / spin    -1.0/step loiter              (no discovery, no progress)
+#   teammate close -0.2/step at contact, 0 beyond spread_radius
 e2e_reward:
-  reward_mode: local_coverage_v1
+  reward_mode: progress
   alpha: 10.0
-  beta: 2.0
+  coverage_reward_growth: 2.0
+  progress_weight: 2.0       # per cell of geodesic approach to believed-uncovered cells
+  loiter_cost: 1.0           # per step, scaled by the missing fraction of full-speed progress
+  spread_weight: 0.2         # per step and teammate, linear in (1 - d / spread_radius)
+  spread_radius: 2.5         # metres; <= comm_radius so the actor sees who it pays for
   tau: 0.02
   wall_kappa: 2.0
   kappa: 5.0
   human_kappa: 10.0
   completion_bonus: 200.0
-  coverage_reward_growth: 2.0
-  room_completion_bonus: 0.0
-  psi: 0.0
-  velocity_cost: 0.0
-  angular_cost: 0.0
-  action_smoothness_cost: 0.0
+  completion_time_bonus: 1.0 # completing at step 0 would pay 2x completion_bonus
