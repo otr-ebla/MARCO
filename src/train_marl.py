@@ -60,7 +60,8 @@ from src.utils.human_curriculum import ghost_robot_probability
 def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
                     tail_dim: int,
                     policy_mode: str = "end-to-end", reward_weights: dict | None = None,
-                    obs_config: dict | None = None, algo: str = "mappo") -> None:
+                    obs_config: dict | None = None, algo: str = "mappo",
+                    actor_config: dict | None = None) -> None:
     """Save parameters, normalizer and the actor/reward regime for evaluation."""
     payload = {
         'update':        update,
@@ -76,6 +77,7 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         # Env keys that fix the actor's input layout, restored by evaluators.
         'obs_config': dict(obs_config or {'obs_mode': 'legacy'}),
         'algo': algo,
+        'actor_config': dict(actor_config or {}),
     }
     # Publish only a fully-written pickle so evaluators can safely load it while
     # training continues. os.replace is atomic when source and target share a
@@ -166,6 +168,7 @@ class DeviceEpisodeStats(NamedTuple):
     human:     jax.Array
     recent_reward:   jax.Array
     recent_coverage: jax.Array
+    recent_recoverage: jax.Array
     recent_length:   jax.Array
     recent_wall:     jax.Array
     recent_robot:    jax.Array
@@ -187,6 +190,7 @@ def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
         human=zeros_e,
         recent_reward=zeros_w,
         recent_coverage=zeros_w,
+        recent_recoverage=jnp.ones((_WINDOW,), jnp.float32),
         recent_length=zeros_w,
         recent_wall=zeros_w,
         recent_robot=zeros_w,
@@ -199,7 +203,7 @@ def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
 
 
 def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
-                        reward_scale: float) -> DeviceEpisodeStats:
+                        reward_scale: float, recoverage: jax.Array) -> DeviceEpisodeStats:
     """Consume one vectorised transition without copying trajectory data to host."""
     stats = stats._replace(
         reward=stats.reward + jnp.mean(trans.reward, axis=-1) / reward_scale,
@@ -210,7 +214,7 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
     )
 
     def one_env(s, xs):
-        done, coverage, complete, timeout, env_idx = xs
+        done, coverage, recov, complete, timeout, env_idx = xs
 
         def finish(x):
             pos = x.ring_pos
@@ -221,6 +225,7 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
             x = x._replace(
                 recent_reward=x.recent_reward.at[pos].set(x.reward[env_idx]),
                 recent_coverage=x.recent_coverage.at[pos].set(coverage),
+                recent_recoverage=x.recent_recoverage.at[pos].set(recov),
                 recent_length=x.recent_length.at[pos].set(x.length[env_idx]),
                 recent_wall=x.recent_wall.at[pos].set(x.wall[env_idx]),
                 recent_robot=x.recent_robot.at[pos].set(x.robot[env_idx]),
@@ -242,7 +247,7 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
     env_idx = jnp.arange(trans.done.shape[0], dtype=jnp.int32)
     stats, _ = jax.lax.scan(
         one_env, stats,
-        (trans.done, trans.coverage, trans.complete, trans.timeout, env_idx),
+        (trans.done, trans.coverage, recoverage, trans.complete, trans.timeout, env_idx),
     )
     return stats
 
@@ -301,7 +306,9 @@ class Rollout:
                     log_prob=log_prob,
                     reward=reward * self.mappo.reward_scale,
                     value=value,
-                    term=term.astype(jnp.float32),
+                    # A stacked observation resets at timeout too. Treat its
+                    # step budget as terminal, as for the recurrent actor.
+                    term=(done if vec_env.env.observation_stack > 1 else term).astype(jnp.float32),
                     done=done.astype(jnp.float32),
                     coverage=info['coverage_ratio'],
                     wall_hit=info['wall_collision_rate'],
@@ -309,10 +316,15 @@ class Rollout:
                     human_hit=info['human_collision_rate'],
                     complete=info['complete'],
                     timeout=info['timeout'],
+                    policy_mask=(~info['fallback_used']).astype(jnp.float32),
+                    sequence_used=info['fallback_sequence_used'].astype(jnp.float32),
+                    safety_override=info['fallback_safety_override'].astype(jnp.float32),
+                    teacher_action=info['executed_action'],
+                    teacher_mask=info['teacher_mask'],
                 )
 
                 episode_stats = _episode_stats_step(
-                    episode_stats, trans, self.mappo.reward_scale
+                    episode_stats, trans, self.mappo.reward_scale, info['recoverage']
                 )
                 
                 next_carry = RolloutCarry(
@@ -359,6 +371,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None,
           wandb_overrides: dict | None = None, num_humans: int = 0,
           num_envs: int | None = None, policy_mode: str = "end-to-end",
+          num_minibatches: int | None = None,
           num_maps: int | None = None,
           additional_updates: int | None = None,
           obs_mode: str | None = None, algo: str = "mappo"):
@@ -396,6 +409,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
     
     if num_envs is not None:
         train_cfg['num_envs'] = num_envs
+    if num_minibatches is not None:
+        train_cfg['num_minibatches'] = num_minibatches
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
@@ -404,13 +419,35 @@ def train(config_path: str, save_dir: str, resume: str | None,
     action_dim = vec_env.action_dim
     tail_dim = env.patch_dim
     obs_dim = env.obs_dim
-    obs_config = {'obs_mode': env.obs_mode}
+    obs_config = {'obs_mode': env.obs_mode, 'use_full_memory': env.use_full_memory,
+                  'observation_stack': env.observation_stack,
+                  'num_robots': env.num_robots, 'n_rays': env.n_rays,
+                  'cell_size': env.cell_size, 'k_teammates': env.k_teammates,
+                  'local_coverage_size': env.local_coverage_size,
+                  'use_local_coverage_obs': env.use_local_coverage_obs,
+                  'sweep_obs': env.sweep_obs, 'crop_summary': env.crop_summary,
+                  'history_cell': env.history_cell,
+                  'critic_context': env.critic_context, 'critic_stack': env.critic_stack,
+                  'critic_crops': env.critic_crops,
+                  'known_coverage_obs': env.known_coverage_obs,
+                  'critic_coverage': env.critic_coverage,
+                  'wall_cells': env.wall_cells}
+    # Persist recovery control settings alongside the observation regime so
+    # evaluation/visualisation reproduce the training controller.
+    obs_config.update({name: getattr(env, name) for name in (
+        'fallback_enabled', 'fallback_revisit_threshold', 'fallback_stall_steps',
+        'fallback_linear_accel', 'fallback_angular_accel', 'fallback_dwa_steps',
+        'fallback_dwa_stall_steps', 'fallback_sequence_steps', 'fallback_sequence_speed')})
+    obs_config.update(comm_radius=env.comm_radius)
     if env.use_memory:
         obs_config.update(comm_radius=env.comm_radius, comm_slots=env.comm_slots,
                           local_coverage_size=env.local_coverage_size)
 
     lidar_embed = model_cfg.get('lidar_embed',  64)
     hidden_size = model_cfg.get('hidden_size', 128)
+    actor_config = dict(lidar_embed=lidar_embed, hidden_size=hidden_size,
+                        log_std_min=model_cfg.get('log_std_min', -5.0),
+                        log_std_max=model_cfg.get('log_std_max', 1.0))
     trunk_in    = lidar_embed + env.obs_vec_dim + tail_dim
 
     print(f"Parallel envs: {E}  |  robots/env: {N}  |  obs_dim: {obs_dim} "
@@ -428,6 +465,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     print(f"Observation: {obs_config}")
     print(f"Reward mode: {env.reward_mode}; weights: {reward_weights}")
+    if env.fallback_enabled:
+        print('Training coverage includes recovery; use evaluate_policies --compare-policy-only to measure autonomous coverage.')
 
     actor = Actor(
         recurrent=policy_mode == "end-to-end-memory",
@@ -435,14 +474,17 @@ def train(config_path: str, save_dir: str, resume: str | None,
         vec_dim=env.obs_vec_dim,
         n_rays=env.n_rays,
         tail_dim=tail_dim,
-        lidar_embed=lidar_embed,
-        hidden_size=hidden_size,
+        memory_map_shape=env.memory_map_shape,
+        observation_stack=env.observation_stack,
+        **actor_config,
     )
     if algo == 'ippo':
         critic = LocalCritic(
             vec_dim=env.obs_vec_dim,
             n_rays=env.n_rays,
             tail_dim=tail_dim,
+            memory_map_shape=env.memory_map_shape,
+            observation_stack=env.observation_stack,
             lidar_embed=lidar_embed,
             hidden_size=model_cfg.get('critic_hidden', 256),
         )
@@ -521,7 +563,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     with open(log_path, 'w', newline='') as f:
         csv.writer(f).writerow(['update', 'episodes', 'env_steps',
-                                'mean_ep_reward', 'mean_ep_coverage',
+                                'mean_ep_reward', 'mean_ep_coverage', 'mean_ep_recoverage',
                                 'coverage_ratio', 'mean_ep_length',
                                 'completion_rate', 'timeout_rate',
                                 'collision_end_rate',
@@ -530,7 +572,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'wall_collisions_per_episode',
                                 'robot_collisions_per_episode',
                                 'human_collisions_per_episode',
-                                'actor_loss', 'critic_loss', 'entropy', 'std'])
+                                'actor_loss', 'critic_loss', 'entropy', 'std', 'approx_kl', 'clip_fraction', 'actor_update_fraction',
+                                'policy_fraction', 'sequence_fraction', 'sequence_override_fraction',
+                                'recovery_imitation_loss', 'teacher_fraction'])
 
     best_policy_score = None
 
@@ -574,16 +618,17 @@ def train(config_path: str, save_dir: str, resume: str | None,
         if update % log_interval == 0:
             s = carry.episode_stats
             compact = jax.device_get((
-                s.recent_reward, s.recent_coverage, s.recent_length,
+                s.recent_reward, s.recent_coverage, s.recent_recoverage, s.recent_length,
                 s.recent_wall, s.recent_robot, s.recent_human,
                 s.recent_outcome, s.ring_count, s.total_count,
                 jnp.mean(traj.coverage[-1]), jnp.mean(traj.wall_hit),
                 jnp.mean(traj.robot_hit), jnp.mean(traj.human_hit), metrics,
+                jnp.mean(traj.policy_mask), jnp.mean(traj.sequence_used), jnp.mean(traj.safety_override),
             ))
-            (recent_reward, recent_coverage, recent_length, recent_wall,
+            (recent_reward, recent_coverage, recent_recoverage, recent_length, recent_wall,
              recent_robot, recent_human, recent_outcome, ring_count,
              ep_count, last_cov, wall_rate, robot_rate, human_rate,
-             losses) = compact
+             losses, policy_fraction, sequence_fraction, override_fraction) = compact
             count = int(ring_count)
             ep_count = int(ep_count)
             valid = slice(0, count)
@@ -593,10 +638,14 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
             mean_ep_r = recent_mean(recent_reward)
             mean_ep_cov = recent_mean(recent_coverage)
+            mean_ep_recov = recent_mean(recent_recoverage) if count else 1.0
             mean_ep_len = recent_mean(recent_length)
             ep_wall_mean = recent_mean(recent_wall)
             ep_robot_mean = recent_mean(recent_robot)
             ep_human_mean = recent_mean(recent_human)
+            policy_fraction = float(policy_fraction)
+            sequence_fraction = float(sequence_fraction)
+            override_fraction = float(override_fraction)
             last_cov = float(last_cov)
             wall_rate = float(wall_rate)
             robot_rate = float(robot_rate)
@@ -614,12 +663,19 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 f"episodes={ep_count:6d} | "
                 f"mean_ep_r={mean_ep_r:8.3f} | "
                 f"ep_cov={mean_ep_cov:6.2%} | "
+                f"recoverage={mean_ep_recov:.3f} | "
                 f"complete={completion_rate:6.2%} | "
                 f"coverage={last_cov:.2%} | "
                 f"actor={float(losses['actor_loss']):7.4f} | "
                 f"critic={float(losses['critic_loss']):7.4f} | "
                 f"entropy={float(losses['entropy']):6.4f} | "
                 f"std={float(losses['std']):5.3f} | "
+                f"kl={float(losses['approx_kl']):.4f} | clip={float(losses['clip_fraction']):.1%} | "
+                f"actor_updates={float(losses['actor_update_fraction']):.1%} | "
+                f"imitation={float(losses['recovery_imitation_loss']):.4f} | "
+                f"teacher={float(losses['teacher_fraction']):.1%} | "
+                f"policy={policy_fraction:.1%} | sequence={sequence_fraction:.1%} | "
+                f"seq_blocked={override_fraction:.1%} | "
                 f"rr={robot_rate:6.2%} | "
                 f"rh={human_rate:6.2%} | "
                 f"rw={wall_rate:6.2%} | "
@@ -630,6 +686,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 csv.writer(f).writerow([
                     update, ep_count, env_steps,
                     round(mean_ep_r,   4), round(mean_ep_cov, 4),
+                    round(mean_ep_recov, 4),
                     round(last_cov,    4), round(mean_ep_len, 1),
                     round(completion_rate,    4),
                     round(timeout_rate,       4),
@@ -644,6 +701,12 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     round(float(losses['critic_loss']), 4),
                     round(float(losses['entropy']),     4),
                     round(float(losses['std']),         4),
+                    round(float(losses['approx_kl']), 6),
+                    round(float(losses['clip_fraction']), 6),
+                    round(float(losses['actor_update_fraction']), 6),
+                    round(policy_fraction, 6), round(sequence_fraction, 6), round(override_fraction, 6),
+                    round(float(losses['recovery_imitation_loss']), 6),
+                    round(float(losses['teacher_fraction']), 6),
                 ])
             if run is not None:
                 wandb.log({
@@ -652,6 +715,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'episode/count':                  ep_count,
                     'episode/mean_reward':            mean_ep_r,
                     'episode/mean_coverage':          mean_ep_cov,
+                    'episode/mean_recoverage':        mean_ep_recov,
                     'episode/mean_length':            mean_ep_len,
                     'episode/coverage_last_step':     last_cov,
                     'rate/completion':                completion_rate,
@@ -665,8 +729,16 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'collision/human_per_episode':    ep_human_mean,
                     'loss/actor':                     float(losses['actor_loss']),
                     'loss/critic':                    float(losses['critic_loss']),
+                    'loss/recovery_imitation':        float(losses['recovery_imitation_loss']),
+                    'control/teacher_fraction':       float(losses['teacher_fraction']),
                     'loss/entropy':                   float(losses['entropy']),
                     'policy/std':                     float(losses['std']),
+                    'policy/approx_kl':               float(losses['approx_kl']),
+                    'policy/clip_fraction':           float(losses['clip_fraction']),
+                    'policy/actor_update_fraction':   float(losses['actor_update_fraction']),
+                    'control/policy_fraction':        policy_fraction,
+                    'control/sequence_fraction':      sequence_fraction,
+                    'control/sequence_override_fraction': override_fraction,
                     'lr/actor':                       lr_a,
                     'lr/critic':                      lr_c,
                 }, step=update)
@@ -681,7 +753,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 save_checkpoint(os.path.join(save_dir, checkpoint_name),
                                 update, actor_state, critic_state, carry.rms,
                                 tail_dim, policy_mode, reward_weights,
-                                obs_config, algo)
+                                obs_config, algo, actor_config)
                 print(
                     f"  → best policy saved (complete={completion_rate:.2%}, "
                     f"coverage={mean_ep_cov:.2%}, contacts/ep="
@@ -694,7 +766,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     save_checkpoint(os.path.join(save_dir, latest_name),
                     total_updates, actor_state, critic_state, carry.rms,
                     tail_dim, policy_mode, reward_weights,
-                    obs_config, algo)
+                    obs_config, algo, actor_config)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms
@@ -733,6 +805,9 @@ if __name__ == '__main__':
                         help='W&B mode; "offline" logs locally with no network')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 64 on GPU if config uses <=16)')
+    parser.add_argument('--minibatches', type=int, default=None,
+                        help='PPO minibatches per epoch, split by environment '
+                             '(overrides train.num_minibatches; must divide --envs)')
     parser.add_argument('--maps', type=int, default=None,
                         help='Procedural map-bank size')
     parser.add_argument('--algo', choices=['mappo', 'ippo'], default='mappo',
@@ -755,6 +830,7 @@ if __name__ == '__main__':
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
           }, num_humans=args.humans, num_envs=args.envs,
+          num_minibatches=args.minibatches,
           policy_mode=args.policy_mode, num_maps=args.maps,
           additional_updates=args.additional_updates,
           obs_mode=args.obs_mode, algo=args.algo)

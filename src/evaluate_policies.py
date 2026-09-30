@@ -38,6 +38,13 @@ from src.utils.jax_device import describe, select_device
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "mappo_baseline.yaml"
 
+CONTROL_FIELDS = [
+    "policy_fraction", "fallback_fraction", "sequence_fraction", "sequence_blocked_fraction",
+    "fallback_stationary_fraction", "fallback_contact_fraction",
+    "blocked_boundary_fraction", "blocked_unknown_fraction", "blocked_edge_fraction",
+    "blocked_lidar_fraction", "blocked_empty_queue_fraction",
+]
+
 FIELDS = [
     "policy", "episode", "seed", "num_humans", "steps",
     "completion_time_steps", "completion_time_seconds", "coverage_rate",
@@ -46,7 +53,7 @@ FIELDS = [
     "wall_collision_rate", "robot_collision_rate", "human_collision_rate",
     "all_collision_rate", "revisits", "cell_entries", "revisit_rate",
     "sweep_efficiency",
-]
+] + CONTROL_FIELDS
 
 
 @dataclass(frozen=True)
@@ -107,7 +114,8 @@ def _record(name: str, episode: int, seed: int, humans: int, steps: int,
 
 def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                   max_steps: int | None, batch_size: int, chunk_steps: int,
-                  stochastic: bool, device, progress_every: int) -> list[dict]:
+                  stochastic: bool, device, progress_every: int,
+                  policy_only: bool = False, recovery_trace: Path | None = None) -> list[dict]:
     if not spec.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {spec.checkpoint}")
     config, env_cfg = _env_config(config_path, spec.humans, max_steps)
@@ -115,14 +123,25 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
         checkpoint = pickle.load(handle)
     recurrent = checkpoint.get("actor_recurrent", False)
     env_cfg.update(checkpoint.get("reward_weights", {}))
+    env_cfg.update({"use_full_memory": False, "observation_stack": 1, "sweep_obs": False,
+                    "crop_summary": False, "critic_crops": False,
+                           "known_coverage_obs": False, "critic_coverage": False,
+                    "goal_obs": False, "wall_cells": 0,
+                           "history_cell": "last_discovery", "critic_context": False,
+                           "critic_stack": 1})
     env_cfg.update(checkpoint.get("obs_config", {"obs_mode": "legacy"}))
+    if policy_only:
+        env_cfg['fallback_enabled'] = False
     vec_env = VecEnv(min(batch_size, episodes), env_cfg)
     env = vec_env.env
     model_cfg = config.get("model", {})
+    actor_cfg = {"lidar_embed": model_cfg.get("lidar_embed", 64),
+                 "hidden_size": model_cfg.get("hidden_size", 128)}
+    actor_cfg.update(checkpoint.get("actor_config", {}))
     actor = Actor(recurrent=recurrent, action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
                   n_rays=env.n_rays, tail_dim=env.patch_dim,
-                  lidar_embed=model_cfg.get("lidar_embed", 64),
-                  hidden_size=model_cfg.get("hidden_size", 128))
+                  memory_map_shape=env.memory_map_shape,
+                  observation_stack=env.observation_stack, **actor_cfg)
     params = jax.device_put(checkpoint["actor_params"], device)
     rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))
     state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
@@ -167,11 +186,26 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             covered_before = state.coverage_grid.reshape(vec_env.E, -1)
             env_ids = jnp.arange(vec_env.E)[:, None]
             revisited = entered & (covered_before[env_ids, current_cell] > 0.5)
+            fallback = info['fallback_used']
+            stationary = jnp.linalg.norm(info['robot_positions'] - state.robot_positions, axis=-1) < 1e-5
+            contacts = (info['wall_hits'] + info['robot_hits'] + info['human_hits']) > 0
+            flags = info['fallback_rejection_flags']
+            control = jnp.stack([
+                jnp.mean(~fallback, axis=-1), jnp.mean(fallback, axis=-1),
+                jnp.mean(info['fallback_sequence_used'], axis=-1),
+                jnp.mean(info['fallback_safety_override'], axis=-1),
+                jnp.mean(fallback & stationary, axis=-1),
+                jnp.mean(fallback & contacts, axis=-1),
+                *[jnp.mean((flags & bit) != 0, axis=-1) for bit in (1, 2, 4, 8, 16)],
+            ], axis=-1)
+            trace = None if recovery_trace is None else (
+                flags, state.robot_positions, state.robot_headings, state.robot_velocities,
+                state.lidar, state.fallback_goal, state.fallback_stagnation, state.step_count)
             output = (rewards.sum(axis=-1), done, term, info["coverage_ratio"],
                       info["covered_cells"], info["complete"], info["timeout"],
                       info["wall_collision_rate"], info["robot_collision_rate"],
                       info["human_collision_rate"], jnp.sum(revisited, axis=-1),
-                      jnp.sum(entered, axis=-1))
+                      jnp.sum(entered, axis=-1), control, trace)
             if recurrent:
                 memory = jnp.where(jnp.repeat(done, env.num_robots)[:, None], 0., memory)
             return (next_state, next_obs, memory), output
@@ -180,6 +214,8 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     run_chunk = jax.jit(run_chunk)
     accum = _empty_accumulators(vec_env.E)
     rows: list[dict] = []
+    control_totals = np.zeros((vec_env.E, len(CONTROL_FIELDS)), np.float64)
+    trace_count = 0
     key = jax.random.PRNGKey(seed + 1_000_003)
     started = time.time()
     print(f"{spec.name}: starting {episodes} episodes "
@@ -188,10 +224,31 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
         key, chunk_key = jax.random.split(key)
         keys = jax.random.split(chunk_key, chunk_steps)
         (state, obs, memory), outputs = run_chunk((state, obs, memory), keys)
-        arrays = [np.asarray(x) for x in jax.device_get(outputs)]
+        arrays = jax.device_get(outputs)
         (rewards, dones, terms, coverage, covered, complete, timeout, walls,
-         robots, humans, revisits, entries) = arrays
+         robots, humans, revisits, entries, control, trace) = arrays
         for t in range(chunk_steps):
+            control_totals += control[t]
+            # A bounded sample of blocked poses, at most one per robot per chunk.
+            if trace is not None and trace_count < 200 and t == 0:
+                flags, positions, headings, velocities, lidar, goals, stagnation, steps = trace
+                with recovery_trace.open('a') as handle:
+                    for e in range(vec_env.E):
+                        for robot in range(env.num_robots):
+                            blocked = np.flatnonzero(flags[:, e, robot])
+                            if not blocked.size or trace_count >= 200:
+                                continue
+                            tick = int(blocked[0])
+                            record = dict(policy=spec.name, env=e, robot=robot,
+                                          step=int(steps[tick, e]), flags=int(flags[tick, e, robot]),
+                                          position=positions[tick, e, robot].tolist(),
+                                          heading=float(headings[tick, e, robot]),
+                                          velocity=velocities[tick, e, robot].tolist(),
+                                          lidar_metres=(lidar[tick, e, robot] * env.max_lidar_range).tolist(),
+                                          goal=int(goals[tick, e, robot]),
+                                          stagnation=int(stagnation[tick, e, robot]))
+                            handle.write(json.dumps(record) + '\n')
+                            trace_count += 1
             accum["steps"] += 1
             accum["return"] += rewards[t]
             accum["wall"] += walls[t] * env.num_robots
@@ -214,6 +271,9 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                     float((accum["entries"][e] - accum["revisits"][e])
                           / max(accum["entries"][e], 1.0)),
                 ))
+                rows[-1].update(zip(CONTROL_FIELDS,
+                                    (control_totals[e] / accum['steps'][e]).tolist()))
+                control_totals[e] = 0
                 for values in accum.values():
                     values[e] = 0
             if len(rows) >= episodes:
@@ -377,6 +437,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--backend", choices=("auto", "cpu", "cuda", "metal"), default="auto")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of using tanh(policy mean)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--policy-only", action="store_true", help="disable recovery after restoring checkpoint settings")
+    mode.add_argument("--compare-policy-only", action="store_true", help="evaluate with and without recovery using identical seeds")
+    parser.add_argument("--recovery-trace", type=Path, help="write up to 200 blocked-pose JSONL samples per policy")
     parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
@@ -393,14 +457,20 @@ def main() -> None:
     specs = [PolicySpec(label, args.humans, path)
              for label, path in zip(labels, args.checkpoint)]
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.recovery_trace is not None:
+        args.recovery_trace.parent.mkdir(parents=True, exist_ok=True)
+        args.recovery_trace.write_text('')
     started = time.time()
     rows = []
     for spec in specs:
-        rows.extend(evaluate_marl(
-            spec, args.config, args.episodes, args.seed, args.max_steps,
-            args.batch_size, args.chunk_steps, args.stochastic, device,
-            args.progress_every,
-        ))
+        for policy_only in ([False, True] if args.compare_policy_only else [args.policy_only]):
+            named = PolicySpec(spec.name + ('/policy-only' if policy_only else '/with-recovery'),
+                               spec.humans, spec.checkpoint)
+            rows.extend(evaluate_marl(
+                named, args.config, args.episodes, args.seed, args.max_steps,
+                args.batch_size, args.chunk_steps, args.stochastic, device,
+                args.progress_every, policy_only, args.recovery_trace,
+            ))
     raw_path = args.output_dir / "episodes.csv"
     write_csv(raw_path, rows, FIELDS)
     summary = summarize(rows)
@@ -410,6 +480,7 @@ def main() -> None:
         "episodes_per_policy": args.episodes, "seed": args.seed,
         "evaluation_humans": args.humans,
         "config": str(args.config.resolve()), "backend": describe(device),
+        "policy_only": args.policy_only, "compare_policy_only": args.compare_policy_only,
         "stochastic": args.stochastic, "elapsed_seconds": time.time() - started,
         "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve())} for s in specs],
     }

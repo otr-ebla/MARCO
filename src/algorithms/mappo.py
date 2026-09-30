@@ -106,7 +106,7 @@ def rms_normalize(rms: RunningMeanStd, x: jax.Array) -> jax.Array:
 class Transition(NamedTuple):
     obs:      jax.Array
     gstate:   object      # GlobalState pytree
-    action:   jax.Array   # tanh(z), what the environment consumed
+    action:   jax.Array   # tanh(z), policy proposal (masked when recovery overrides it)
     z:        jax.Array   # pre-squash Gaussian sample, see _update
     log_prob: jax.Array
     reward:   jax.Array
@@ -121,6 +121,11 @@ class Transition(NamedTuple):
     complete:  jax.Array  # 1.0 when the map was fully covered on this step
     timeout:   jax.Array  # 1.0 when the step hit the truncation horizon
     memory:    object = None  # pre-observation GRU state (E*N, H), recurrent only
+    policy_mask: object = None  # (T, E, N), 0 for actions overridden by recovery
+    sequence_used: object = None # (T, E, N), recovery sequence executed
+    safety_override: object = None # (T, E, N), sequence interrupted by live scan
+    teacher_action: object = None # executed recovery command, never used as a PPO sample
+    teacher_mask: object = None   # collision-free, nonstationary recovery steps
 
 
 class RolloutCarry(NamedTuple):
@@ -170,6 +175,22 @@ def _tanh_normal_entropy(mean: jax.Array, std: jax.Array) -> jax.Array:
     expected_log_jacobian = jnp.sum(log_jacobian * weights, axis=-1)
     normal_entropy = jnp.log(std) + 0.5 * (1.0 + _LOG_2PI)
     return jnp.sum(normal_entropy + expected_log_jacobian, axis=-1)
+
+
+def policy_update_diagnostics(log_ratio, mask, clip_eps):
+    """Sample KL estimate and clipping fraction, excluding overridden actions."""
+    log_ratio = jnp.where(mask > 0, log_ratio, 0.)
+    ratio = jnp.exp(log_ratio)
+    denominator = jnp.maximum(mask.sum(), 1.)
+    approx_kl = jnp.sum((jnp.expm1(log_ratio) - log_ratio) * mask) / denominator
+    clip_fraction = jnp.sum((jnp.abs(ratio - 1.) > clip_eps) * mask) / denominator
+    return approx_kl, clip_fraction
+
+
+def recovery_imitation_loss(mean, target_action, mask):
+    """Fit the deterministic policy to valid executed recovery commands."""
+    error = jnp.mean((jnp.tanh(mean) - jax.lax.stop_gradient(target_action)) ** 2, axis=-1)
+    return jnp.sum(error * mask) / jnp.maximum(mask.sum(), 1.)
 
 
 @jax.jit
@@ -255,8 +276,24 @@ class MAPPO:
 
         self.clip_eps      = float(config.get('clip_eps',      0.2))
         self.entropy_coef  = float(config.get('entropy_coef',  0.01))
+        self.recovery_imitation_coef = float(config.get('recovery_imitation_coef', 0.0))
+        if self.recovery_imitation_coef < 0:
+            raise ValueError('recovery_imitation_coef must be non-negative')
+        self.target_kl = float(config.get('target_kl', 0.0))
+        if self.target_kl < 0:
+            raise ValueError('target_kl must be non-negative (0 disables the guard)')
         self.max_grad_norm = float(config.get('max_grad_norm', 10.0))
         self.n_epochs      = int(config.get('n_epochs',      10))
+        # Each epoch splits the environments into this many disjoint groups and
+        # takes one gradient step per group. Splitting along E keeps every
+        # rollout time-ordered, as the recurrent replay requires, and bounds the
+        # update's peak memory by E / num_minibatches instead of E.
+        self.num_minibatches = int(config.get('num_minibatches', 1))
+        if vec_env.E % self.num_minibatches:
+            raise ValueError(
+                f"num_envs ({vec_env.E}) must be divisible by "
+                f"num_minibatches ({self.num_minibatches})"
+            )
         self.gamma         = float(config.get('gamma',         0.99))
         self.gae_lambda    = float(config.get('gae_lambda',    0.95))
         # Static, stateless alternative to return normalisation: a constant
@@ -399,6 +436,11 @@ class MAPPO:
                 human_hit=info['human_collision_rate'],
                 complete=info['complete'],
                 timeout=info['timeout'],
+                policy_mask=(~info['fallback_used']).astype(jnp.float32),
+                sequence_used=info['fallback_sequence_used'].astype(jnp.float32),
+                safety_override=info['fallback_safety_override'].astype(jnp.float32),
+                teacher_action=info['executed_action'],
+                teacher_mask=info['teacher_mask'],
             )
             return RolloutCarry(env_state, next_obs, next_gstate, rms), transition
 
@@ -423,79 +465,132 @@ class MAPPO:
         lr_critic: jax.Array,
     ) -> tuple[TrainState, TrainState, dict]:
         t, e, n = traj.obs.shape[0], traj.obs.shape[1], traj.obs.shape[2]
-        flat = t * e * n
-
-        # Feed-forward actors consume this flat batch directly. Recurrent
-        # actors use the original ordered trajectory below and flatten only
-        # their outputs so PPO ratios stay aligned with these action arrays.
-        obs_f = traj.obs.reshape(flat, -1)
-        act_f = traj.action.reshape(flat, -1)
-        # The pre-squash sample is replayed from the rollout instead of being
-        # recovered with arctanh(action): arctanh needs the action clipped away
-        # from +-1 first, and that clip silently rewrites z for exactly the
-        # saturated samples that dominate once sigma grows, corrupting the ratio.
-        z_f = traj.z.reshape(flat, -1)
-        old_log_prob = traj.log_prob.reshape(flat)
+        num_mb = self.num_minibatches
+        e_mb = e // num_mb
+        flat = t * e_mb * n
 
         # Per-agent advantage; the batch statistics are shared, the values are
         # not. Normalised over the whole (T, E, N) batch, once, before the
         # epoch scan: every epoch must see the same targets.
-        adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        adv_f = adv.reshape(flat)
+        policy_mask = jnp.ones_like(advantages) if traj.policy_mask is None else traj.policy_mask
+        count = jnp.maximum(policy_mask.sum(), 1.)
+        mean_adv = (advantages * policy_mask).sum() / count
+        var_adv = (((advantages - mean_adv) ** 2) * policy_mask).sum() / count
+        adv = (advantages - mean_adv) / (jnp.sqrt(var_adv) + 1e-8)
 
-        # Expanded once here rather than inside the epoch scan: the per-agent
-        # channel stack is the largest tensor in the update.
-        critic_args = self._critic_args(traj.obs, traj.gstate)
-        returns_f = returns.reshape(flat)
+        # Only the fields the losses read; memory is (T, E*N, H), so it is
+        # regrouped by environment before slicing and flattened back after.
+        batch = (
+            traj.obs, traj.gstate, traj.action, traj.z, traj.log_prob,
+            traj.done, adv, returns, policy_mask,
+            None if traj.memory is None else traj.memory.reshape(t, e, n, -1),
+            jnp.zeros_like(traj.action) if traj.teacher_action is None else traj.teacher_action,
+            jnp.zeros_like(policy_mask) if traj.teacher_mask is None else traj.teacher_mask,
+        )
 
-        def actor_loss_fn(params):
-            if self.actor.recurrent:
-                _, (mean, log_std) = recurrent_actor_sequence(
-                    self.actor, params, traj.obs, traj.memory[0], traj.done)
-            else:
-                mean, log_std = self.actor.apply(params, obs_f)
+        def select(env_idx):
+            if num_mb == 1:
+                return batch
+            return jax.tree_util.tree_map(
+                lambda x: jnp.take(x, env_idx, axis=1), batch)
+
+        def minibatch(carry, env_idx):
+            a_state, c_state, actor_enabled = carry
+            (obs, gstate, action, z, log_prob, done, adv_b, returns_b, mask_b,
+             memory, teacher_action, teacher_mask) = select(env_idx)
+
+            # Feed-forward actors consume this flat batch directly. Recurrent
+            # actors use the ordered trajectory and flatten only their outputs
+            # so PPO ratios stay aligned with these action arrays.
+            obs_f = obs.reshape(flat, -1)
+            act_f = action.reshape(flat, -1)
+            # The pre-squash sample is replayed from the rollout instead of being
+            # recovered with arctanh(action): arctanh needs the action clipped
+            # away from +-1 first, and that clip silently rewrites z for exactly
+            # the saturated samples that dominate once sigma grows, corrupting
+            # the ratio.
+            z_f = z.reshape(flat, -1)
+            old_log_prob = log_prob.reshape(flat)
+            adv_f = adv_b.reshape(flat)
+            returns_f = returns_b.reshape(flat)
+            # The per-agent channel stack is the largest tensor in the update;
+            # it is expanded per minibatch so its size scales with E / num_mb.
+            critic_args = self._critic_args(obs, gstate)
+            initial_memory = None if memory is None else memory[0].reshape(e_mb * n, -1)
+
+            def actor_loss_fn(params):
+                if self.actor.recurrent:
+                    _, (mean, log_std) = recurrent_actor_sequence(
+                        self.actor, params, obs, initial_memory, done)
+                else:
+                    mean, log_std = self.actor.apply(params, obs_f)
+                loss, diagnostics = ppo_loss(mean, log_std, z_f, act_f, old_log_prob, adv_f, mask_b.reshape(flat))
+                imitation = recovery_imitation_loss(mean, teacher_action.reshape(flat, -1), teacher_mask.reshape(flat))
+                return loss + self.recovery_imitation_coef * imitation, (*diagnostics, imitation)
+
+            def critic_loss_fn(params):
+                values = self.critic.apply(params, *critic_args).squeeze(-1)
+                # Huber rather than MSE: the completion bonuses are sparse and
+                # large, so a single unpredicted bonus produces an error the
+                # squared loss amplifies into a gradient that wipes out the value
+                # head. Huber is quadratic within delta and linear beyond it,
+                # which caps the per-sample gradient at delta — gradient clipping
+                # that acts per sample instead of on the summed batch norm.
+                # optax.huber_loss already carries the 0.5 factor in the
+                # quadratic branch, so no extra scaling here.
+                return jnp.mean(
+                    optax.huber_loss(values, returns_f, delta=self.huber_delta)
+                )
+
+            (_, (a_loss, entropy, std, approx_kl, clip_fraction, imitation)), a_grads = jax.value_and_grad(
+                actor_loss_fn, has_aux=True
+            )(a_state.params)
+            actor_enabled = actor_enabled & ((self.target_kl <= 0)
+                                             | (approx_kl <= self.target_kl))
+            actor_updated = actor_enabled & (jnp.any(mask_b > 0)
+                | ((self.recovery_imitation_coef > 0) & jnp.any(teacher_mask > 0)))
+            a_state = jax.lax.cond(actor_updated,
+                                   lambda: _apply_gradients(a_state, a_grads, lr_actor),
+                                   lambda: a_state)
+
+            c_loss, c_grads = jax.value_and_grad(critic_loss_fn)(c_state.params)
+            c_state = _apply_gradients(c_state, c_grads, lr_critic)
+            return (a_state, c_state, actor_enabled), (
+                a_loss, c_loss, entropy, std, approx_kl, clip_fraction,
+                actor_updated.astype(jnp.float32), imitation)
+
+        def ppo_loss(mean, log_std, z_f, act_f, old_log_prob, adv_f, mask):
             std = jnp.exp(log_std)
             log_prob = _tanh_normal_log_prob(z_f, mean, std, act_f)
 
             ratio = jnp.exp(log_prob - old_log_prob)
             surr1 = ratio * adv_f
             surr2 = jnp.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_f
-            loss = -jnp.mean(jnp.minimum(surr1, surr2))
+            denominator = jnp.maximum(mask.sum(), 1.)
+            loss = -jnp.sum(jnp.minimum(surr1, surr2) * mask) / denominator
 
             # This must be evaluated under the *current* policy. Reusing fixed
             # rollout samples gives a cross-entropy gradient which incorrectly
             # drives std upward. Quadrature keeps the tanh Jacobian differentiable
             # and makes the bonus actively pull saturated actions back inward.
-            entropy = jnp.mean(_tanh_normal_entropy(mean, std))
-            return loss - self.entropy_coef * entropy, (loss, entropy, jnp.mean(std))
+            entropy = jnp.sum(_tanh_normal_entropy(mean, std) * mask) / denominator
+            approx_kl, clip_fraction = policy_update_diagnostics(
+                log_prob - old_log_prob, mask, self.clip_eps)
+            return loss - self.entropy_coef * entropy, (
+                loss, entropy, jnp.mean(std), approx_kl, clip_fraction)
 
-        def critic_loss_fn(params):
-            values = self.critic.apply(params, *critic_args).squeeze(-1)
-            # Huber rather than MSE: the completion bonuses are sparse and large,
-            # so a single unpredicted bonus produces an error the squared loss
-            # amplifies into a gradient that wipes out the value head. Huber is
-            # quadratic within delta and linear beyond it, which caps the
-            # per-sample gradient at delta — gradient clipping that acts per
-            # sample instead of on the summed batch norm.
-            # optax.huber_loss already carries the 0.5 factor in the quadratic
-            # branch, so no extra scaling here.
-            return jnp.mean(
-                optax.huber_loss(values, returns_f, delta=self.huber_delta)
-            )
+        def epoch(carry, key):
+            # A fresh environment partition every epoch; with a single
+            # minibatch the permutation is unused and the update is full-batch.
+            groups = jax.random.permutation(key, e).reshape(num_mb, e_mb)
+            return jax.lax.scan(minibatch, carry, groups)
 
-        def epoch(carry, _):
-            a_state, c_state = carry
-            (_, (a_loss, entropy, std)), a_grads = jax.value_and_grad(
-                actor_loss_fn, has_aux=True
-            )(a_state.params)
-            a_state = _apply_gradients(a_state, a_grads, lr_actor)
-
-            c_loss, c_grads = jax.value_and_grad(critic_loss_fn)(c_state.params)
-            c_state = _apply_gradients(c_state, c_grads, lr_critic)
-            return (a_state, c_state), (a_loss, c_loss, entropy, std)
-
-        (actor_state, critic_state), (a_losses, c_losses, entropies, stds) = jax.lax.scan(
-            epoch, (actor_state, critic_state), None, length=self.n_epochs
+        # Derived from the optimiser step so successive updates reshuffle
+        # without threading a key through the training loop.
+        keys = jax.random.split(
+            jax.random.fold_in(jax.random.PRNGKey(0), actor_state.step), self.n_epochs)
+        (actor_state, critic_state, _), (a_losses, c_losses, entropies, stds, kls, clip_fractions, actor_updates, imitation_losses) = jax.lax.scan(
+            epoch, (actor_state, critic_state, jnp.bool_(True)), keys
         )
         metrics = {
             'actor_loss':  jnp.mean(a_losses),
@@ -503,7 +598,12 @@ class MAPPO:
             'entropy':     jnp.mean(entropies),
             # Logged explicitly: sigma is the quantity that actually diverged,
             # and reading it off the entropy is guesswork once tanh is involved.
-            'std':         stds[-1],
+            'std':         stds[-1, -1],
+            'approx_kl':   jnp.mean(kls),
+            'clip_fraction': jnp.mean(clip_fractions),
+            'actor_update_fraction': jnp.mean(actor_updates),
+            'recovery_imitation_loss': jnp.mean(imitation_losses),
+            'teacher_fraction': jnp.mean(batch[-1]),
         }
         return actor_state, critic_state, metrics
 

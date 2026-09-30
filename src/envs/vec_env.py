@@ -136,11 +136,12 @@ class VecEnv:
             s = jax.tree_util.tree_map(
                 lambda f, c: _select(done, f, c), fresh, s.replace(key=key)
             )
-            if self.env.use_memory:
+            if self.env.track_memory:
                 # One scan per step for both branches: a fresh episode starts
                 # with an empty memory and an uncovered spawn cell, exactly
                 # as `env.reset` would produce.
                 s = self.env._refresh_memory(s, cover & ~done)
+            s = self.env._push_observation(s)
 
             return (s, self.env.get_obs(s), reward, term, done,
                     info, self.env.get_global_state(s))

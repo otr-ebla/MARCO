@@ -12,7 +12,7 @@ class ProceduralMapLayout:
     """
     def __init__(self, width=12.0, height=8.0, min_room_size=2.0, max_walls=30,
                  cell_size: float = 0.5, robot_radius: float = 0.20,
-                 rng: random.Random | None = None):
+                 rng: random.Random | None = None, wall_cells: int = 1):
         self.width = width
         self.height = height
         self.min_room_size = min_room_size
@@ -20,9 +20,14 @@ class ProceduralMapLayout:
         self.cell_size = cell_size
         self.robot_radius = robot_radius
         self._rng = rng if rng is not None else random.Random()
+        self.wall_cells = int(wall_cells)
+        if self.wall_cells < 0 or self.wall_cells != wall_cells:
+            raise ValueError('wall_cells must be a non-negative integer (0 is legacy geometry)')
         
         self.outer_t = 0.20
         self.inner_t = 0.08
+        if self.wall_cells:
+            self.outer_t = self.inner_t = self.wall_cells * self.cell_size
         # Ensure door spans an integer number of cells (at least 2 cells = 1.0m)
         self.door_cells = max(2, int(np.ceil((2 * cell_size + 2 * robot_radius) / cell_size)))
         self.door_size = self.door_cells * self.cell_size
@@ -39,7 +44,59 @@ class ProceduralMapLayout:
         self.walls.append([self.width, -self.outer_t, self.width + self.outer_t, self.height + self.outer_t])
         
         # 2. Recursive BSP to create rooms
-        self._split_space(0.0, 0.0, self.width, self.height, depth=0, max_depth=3)
+        if self.wall_cells:
+            self._split_grid(0, 0, int(self.width / self.cell_size),
+                             int(self.height / self.cell_size), 0, set())
+        else:
+            self._split_space(0.0, 0.0, self.width, self.height, depth=0, max_depth=3)
+
+    def _split_grid(self, x, y, w, h, depth, protected):
+        """BSP with whole-cell wall bands and protected doorway approaches.
+
+        Child rooms exclude the wall band. Keeping the cells immediately on
+        either side of every door free prevents later splits sealing a door.
+        """
+        if depth >= 3:
+            return
+        horizontal = w < h
+        if max(w, h) < 1.2 * min(w, h):
+            horizontal = self._rng.choice([True, False])
+        thickness = self.wall_cells
+        minimum = max(1, int(np.ceil(self.min_room_size / self.cell_size)))
+        along, across = (w, h) if horizontal else (h, w)
+        splits = list(range(minimum, across - minimum - thickness + 1))
+        self._rng.shuffle(splits)
+        for split in splits:
+            doors = list(range(along - self.door_cells + 1))
+            self._rng.shuffle(doors)
+            for door in doors:
+                # Keep nonempty wall segments at least two cells long.
+                if (0 < door < 2 or 0 < along - door - self.door_cells < 2):
+                    continue
+                def cell(a, b):
+                    return (x + a, y + b) if horizontal else (x + b, y + a)
+                wall = {cell(a, b) for a in range(along)
+                        if not door <= a < door + self.door_cells
+                        for b in range(split, split + thickness)}
+                if wall & protected or not wall:
+                    continue
+                for a0, a1 in ((0, door), (door + self.door_cells, along)):
+                    if a0 == a1:
+                        continue
+                    x0, y0 = cell(a0, split)
+                    x1, y1 = cell(a1, split + thickness)
+                    self.walls.append([v * self.cell_size for v in (x0, y0, x1, y1)])
+                protected.update(cell(a, b) for a in range(door, door + self.door_cells)
+                                 for b in range(split - 1, split + thickness + 1))
+                if horizontal:
+                    self._split_grid(x, y, w, split, depth + 1, protected)
+                    self._split_grid(x, y + split + thickness, w,
+                                     h - split - thickness, depth + 1, protected)
+                else:
+                    self._split_grid(x, y, split, h, depth + 1, protected)
+                    self._split_grid(x + split + thickness, y,
+                                     w - split - thickness, h, depth + 1, protected)
+                return
 
     def _split_space(self, x, y, w, h, depth, max_depth):
         if depth >= max_depth:

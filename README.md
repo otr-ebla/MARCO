@@ -31,10 +31,10 @@ During training, the central critic leverages privileged global state (full robo
 ## 🧠 Proposed Approach & Novelty
 
 1. **End-to-end MARL via MAPPO:**
-   Robots learn coverage from scratch with **MAPPO** (Multi-Agent Proximal Policy Optimization) under CTDE. There is no planner in the loop: each actor sees only its own observation and commands its own linear and angular velocity, so the same policy runs on any floor plan without knowing the layout in advance.
+   Robots learn velocity control with **MAPPO** (Multi-Agent Proximal Policy Optimization) under CTDE. The sequential actor observes its personal map and previously visited cell, and chooses where to go itself. Recovery demonstrations provide a training-only imitation loss; no next-cell target or waypoint is supplied to the actor. The actor commands linear and angular velocity; recovery can temporarily take control when it gets stuck. Evaluate with recovery disabled to measure the learned policy's independent performance.
 
 2. **Coordination from the reward alone:**
-   Spreading, handing over remaining work and avoiding redundant sweeps are not scripted. They emerge from a layout-agnostic reward built on what each robot knows (see *Reward* below).
+   Spreading and avoiding redundant sweeps are learning objectives, encouraged by the reward (see *Reward* below). Actors choose velocities directly; successful coordination must be measured in evaluation.
 
 3. **Novelty — Dynamic Human Obstacles:**
    The environment includes dynamic, unpredictable obstacles—specifically modeled as **humans moving through the workspace**. Traditional coverage algorithms assume static environments. Our MARL agents must learn to balance total environment coverage with the safety-critical need to avoid moving pedestrians.
@@ -130,6 +130,7 @@ Training uses `reward_mode: progress`, configured under `e2e_reward` in
 |---|---:|
 | Newly covered cell | +10 × (1 + 2 × team coverage) |
 | Progress towards work | +2 per cell of approach |
+| Travel off the horizontal/vertical axes | −0.5 × (error / 45°)² × speed / v_max |
 | Loitering (no discovery) | −1 × (1 − progress / full-speed progress) |
 | Teammate within 2.5 m | −0.2 × (1 − d / 2.5 m), per teammate |
 | Each timestep | −0.02 |
@@ -142,10 +143,10 @@ geodesic over free cells, so progress is only paid along real paths. The
 implicit target lives only in the reward; the actor never observes it.
 
 * **Transit is paid, wandering is not.** Driving at full speed towards work over
-  covered cells earns about +0.38 per step; parking or spinning costs −1.02;
+  covered cells earns about +0.58 per step when aligned with an axis; parking or spinning costs −1.02;
   driving away costs −1.42. A robot whose area is done is therefore pushed to
   where teammates still have work.
-* **Closed loops earn nothing.** Both potentials of a step use the same field, so
+* **The progress potential telescopes.** Both potentials of a step use the same field, so
   progress telescopes to zero over any loop and covering a cell never looks like
   a loss of progress.
 * **Spreading** is a constant pressure against staying close; who yields on a
@@ -156,6 +157,143 @@ which is stored in the checkpoint and restored by both evaluators.
 
 ### Actor with memory
 
+#### Sequential coverage with five-frame observations
+
+`config/mappo_sequential.yaml` addresses the case where the local 5×5 crop is
+already covered but work remains elsewhere. It adds:
+
+* A CNN over the robot's **complete personal map**: known obstacles, believed
+  coverage, known cells, self and currently observable teammates. Unknown map
+  geometry and distant teammate positions are not exposed to the actor.
+* Grid-aligned walls with `env.wall_cells: 1`: every interior wall occupies a
+  full cell band (0.5 m here), so physics, lidar, occupancy and planning agree.
+  Doorways and their approaches remain open during recursive room generation.
+  `wall_cells: 0` retains the old thin-wall layouts for older checkpoints.
+* `env.history_cell: previous_visit`: a valid flag and relative position of
+  the cell visited immediately before the current cell, including revisits.
+  This history changes only on accepted cell entries, persists while dwelling,
+  and resets at episode boundaries. The actor also keeps its past sweep direction.
+  It receives no planned next cell, target bearing or route distance: destination
+  selection must be learned from map memory and history. `critic_context: true`
+  supplies time and control/reward history to the centralized critic only.
+* `env.critic_stack: 5`: the centralized critic receives five ordered global
+  frames. Each frame contains walls, team coverage, each robot's position,
+  and a separate visit-count map for **every** robot. The vector contains all
+  robots' kinematics and their previous visited cells, including a validity
+  marker for cells that have not been visited yet. Zero padding marks missing
+  frames at episode start; completion and timeout clear the history. These
+  visit-count maps and stacked global frames are critic inputs only.
+* An ordered stack of the **last five observations**, including the current one
+  (`env.observation_stack: 5`). With `dt: 0.1`, the oldest frame is 0.4 seconds
+  behind the newest. The encoder shares weights across frames, then concatenates
+  their features in time order. Missing frames at episode start are zero-filled;
+  auto-reset clears only the finished environment's history. The stack works
+  with either the feed-forward actor or the GRU and supplies short-term context,
+  not a guarantee of long-term memory or successful coverage. Stacked training
+  treats timeout as a terminal horizon for GAE, so values never cross a reset.
+* `reward_mode: sequential`: +6 for a newly covered cell adjacent to that
+  robot's previous discovery, another +4 when continuing the same grid direction.
+  A boustrophedon lane change earns an extra +8: after at least two straight
+  new-cell edges, discover one perpendicular adjacent cell and then a new cell
+  in the opposite direction to the original run. A revisit breaks this pattern;
+  turning in place preserves it but earns no discovery bonus.
+* Revisit costs start high and decrease within each episode. With
+  `phase = max(coverage_fraction, elapsed_steps / max_steps)`, the per-entry
+  weight is `6 * (0.025 + 0.975 * (1 - phase)^2)`: 6 initially, about 1.61 at
+  phase 0.5, and 0.15 at completion or timeout. Multiply by the consecutive
+  revisit streak, capped at 3. New discoveries reset the streak; dwelling and
+  rejected moves do not charge another entry. This discourages early overlap
+  while allowing late transit through already cleaned rooms.
+* Progress routes computed only through known free cells, toward reachable
+  believed-uncovered cells, falling back to exploration frontiers when needed.
+  Spreading is charged only for
+  teammates represented in communication slots, with weight 0.5 within 2.5 m.
+* A configurable pre-tanh standard-deviation floor of about 0.10. This prevents
+  Gaussian sigma collapsing to 0.009; tanh saturation can still reduce action noise.
+* `train.recovery_imitation_coef: 0.5`: a separate supervised loss fits
+  `tanh(policy_mean)` to executed recovery commands. Only collision-free,
+  nonstationary recovery commands are used. PPO ratios and entropy still use
+  policy-controlled samples only; recovery actions are never relabelled as
+  policy samples. Set the coefficient to zero to disable imitation. Logs include
+  `recovery_imitation_loss` and `teacher_fraction`.
+
+For the updated geometry, reward and previous-cell semantics, start a **new training run**:
+
+```bash
+python -m src.train_marl --config config/mappo_sequential.yaml \
+  --policy-mode end-to-end-memory --backend cuda --no-wandb \
+  --save-dir checkpoints/sequential_navigation
+```
+
+This configuration starts with 32 environments, 128 rollout steps and 8
+minibatches. Five complete maps per observation substantially increase memory
+use; GPU capacity has to be checked before scaling back to 512 environments.
+These settings also collect fewer environment steps per update than the old
+512-environment run: compare training budgets in environment steps, not updates.
+The new reward encourages contiguous sweeps; it does not prescribe a complete
+coverage path or guarantee map completion. Compare completion rate, revisits,
+sweep efficiency and collisions on held-out map seeds after training.
+
+```bash
+python -m src.visualize_policy \
+  --config config/mappo_sequential.yaml \
+  --checkpoint checkpoints/sequential_navigation/checkpoint_e2e_memory_latest.pkl \
+  --policy-only
+```
+
+Measure both assisted and independent coverage on the same evaluation seeds:
+
+```bash
+python -m src.evaluate_policies --config config/mappo_sequential.yaml \
+  --checkpoint checkpoints/sequential_navigation/checkpoint_e2e_memory_latest.pkl \
+  --humans 0 --episodes 100 --seed 123 --compare-policy-only
+```
+
+Training coverage and checkpoint rankings include recovery whenever enabled.
+Judge progress using policy-only completion, contacts, revisits and recovery
+usage, not assisted coverage alone. The full-memory actor retains the original
+observation width, but previous-cell semantics and map geometry differ from the
+old run. Existing checkpoints remain loadable with their original observations.
+
+To visualize an old policy, use its existing checkpoint:
+
+```bash
+python -m src.visualize_policy \
+  --checkpoint checkpoints/sequential_stack5/checkpoint_e2e_memory.pkl \
+  --config config/mappo_sequential.yaml
+```
+
+This restores the old policy's observation semantics (last newly discovered cell)
+and thin walls. Append `--wall-cells 1` to run those same weights on full-cell
+wall layouts instead; this changes the environment, not the trained policy.
+New checkpoints record `history_cell` and wall geometry explicitly.
+
+Observation stack, personal-map settings, encoder sizes and exploration bounds
+are saved in checkpoints and restored by both evaluators. Old checkpoints without
+these settings retain their original single-frame actor. `checkpoint_e2e_memory.pkl`
+is the selected **best** checkpoint; `_latest.pkl` contains the final update. A
+file reporting update 140 is evaluating that saved policy, even after training
+has reached update 2500.
+
+The training line also reports `recoverage`, averaged over the same recent
+completed episodes as `ep_cov`. For each episode it is **total team cell visits /
+distinct covered cells**: 1.000 means no repeated coverage, 1.500 means 150 visits
+over 100 distinct cells, 2.000 means two visits per covered cell on average.
+The first accepted occupancy counts as a visit; subsequent visits require leaving
+and entering a cell again. Standing still, rotation within a cell and blocked
+collision attempts do not increase the count. Before any completed episode (or
+with no covered cells), the neutral value is 1.000. Low recoverage should always
+be read alongside coverage and completion, since an idle robot can also have 1.
+CSV stores `mean_ep_recoverage`; W&B stores `episode/mean_recoverage`.
+
+The stronger rewards and this metric preserve the stack-5 actor architecture,
+so an existing stack-5 checkpoint can be resumed with the updated config. New
+reward weights are saved in subsequent checkpoints; older checkpoints retain
+their saved weights when evaluated. An already running process must be restarted
+to use these code/config changes.
+
+#### Recurrent actor
+
 Select `--policy-mode end-to-end-memory` to add a GRU (width `model.hidden_size`,
 128 by default) after the local observation encoder.
 
@@ -163,6 +301,16 @@ Select `--policy-mode end-to-end-memory` to add a GRU (width `model.hidden_size`
 python -m src.train_marl --policy-mode end-to-end-memory --obs-mode memory_comm \
   --save-dir checkpoints/e2e_memory_humans8 --humans 8 --envs 8 --maps 64 \
   --backend cuda --no-wandb
+```
+
+To run more environments than fit in one PPO update, split each epoch into
+minibatches of environments with `--minibatches` (must divide `--envs`). On a
+10 GB GPU, 64 environments per minibatch fit:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 python -m src.train_marl \
+  --policy-mode end-to-end-memory --obs-mode memory_comm \
+  --envs 512 --minibatches 8 --backend cuda --save-dir checkpoints/e2e_memory_E512
 ```
 
 Train from scratch: feed-forward checkpoints have incompatible actor parameters.
@@ -179,12 +327,13 @@ mid-episode simulator state.
 
 Outputs: `checkpoint_e2e_memory.pkl` (best),
 `checkpoint_e2e_memory_latest.pkl` (end of training), and
-`training_log_e2e_memory.csv`. Both evaluators detect recurrent checkpoints:
+`training_log_e2e_memory.csv`. Both the visualizer and the evaluator detect
+recurrent checkpoints:
 
 ```bash
-python -m src.test_visual \
+python -m src.visualize_policy \
   --checkpoint checkpoints/e2e_memory_humans8/checkpoint_e2e_memory.pkl \
-  --humans 8 --backend cpu
+  --humans 8
 
 python -m src.evaluate_policies \
   --checkpoint checkpoints/e2e_memory_humans8/checkpoint_e2e_memory.pkl
@@ -192,3 +341,111 @@ python -m src.evaluate_policies \
 
 Resume a trained actor for a fixed fine-tuning phase with
 `--additional-updates`. The reward weights are persisted in every checkpoint.
+
+
+### Memory-based recovery (training and evaluation)
+
+The shared environment switches each robot to A* plus local DWA after seven
+consecutive entries into covered cells, or 70 physics steps without discovering
+a new cell (including stopping or spinning). Both thresholds are configurable
+under `env` with `fallback_revisit_threshold` and `fallback_stall_steps`.
+`fallback_enabled: false` disables recovery for ablations.
+
+A* chooses the closest reachable remembered, uncovered cell by four-connected
+path length. It routes through known free cells and respects remembered wall
+edges, including thin walls between free cell centres. DWA follows successive
+waypoints using acceleration-limited velocity samples, a 12-step prediction
+horizon, and current lidar clearance. Its speed and turn acceleration limits are
+`fallback_linear_accel` and `fallback_angular_accel`; the horizon is
+`fallback_dwa_steps`. Recovery retains its target until reached, replans if
+shared coverage or new wall observations invalidate it, and returns control to
+the actor after reaching work. With no reachable remembered work, the actor
+continues without an activation charge. The controller does not use the critic's
+global coverage or unseen obstacle map. Recovery is a local heuristic; moving
+obstacles can still delay it.
+
+If DWA goes `fallback_dwa_stall_steps` (default 30) without reducing its
+remaining A* route distance by at least 2 cm, recovery switches to a generated
+sequence of physical `(linear_velocity, angular_velocity)` commands. The sequence
+turns toward cell centres, drives, and brakes before turns. It buffers
+`fallback_sequence_steps` commands (default 64), replenishes them along the route,
+and caps forward speed at `fallback_sequence_speed` (default 0.4 m/s). New wall
+observations reset the progress baseline so discovering a necessary detour does
+not itself count as getting stuck.
+
+Before each queued command, a guard checks that command and its braking motion
+against the latest lidar, known free cells, and remembered wall edges. If the
+sequence becomes unsafe, DWA supplies reactive avoidance or a stop, the queue is
+discarded, and the sequence is replanned from the actual pose. Currently sensed
+obstacles can cause a temporary route detour; they are not added to permanent
+wall memory. A changed target, collision, or episode reset also invalidates queued
+commands. This keeps execution responsive to moving obstacles, although persistent
+blockages can still prevent arrival. Escalating from DWA to sequence control adds
+no second activation charge. Both controllers remain excluded from the PPO
+policy-gradient loss; valid commands can train the actor through the separate
+recovery imitation loss described above.
+
+Training logs report `policy` (fraction of robot-steps controlled by RL),
+`sequence` (fraction executing queued commands), and `seq_blocked` (fraction where
+the live guard interrupted a sequence). DWA's fraction is `1 - policy - sequence`.
+The same fractions are saved to CSV and W&B. New controller settings are saved
+with checkpoints; a running process needs restarting to load code changes.
+
+`e2e_reward.fallback_cost` defaults to 10 and is charged once on the policy step
+that triggers a successful activation. `revisit_cost` defaults to 1: consecutive
+covered-cell entries incur -1, -2, -3, and so on, in every reward mode. Discovering
+a new cell resets the streak. Dwelling and rejected moves do not count as cell
+entries. The sequential configuration overrides this with the decaying, capped
+schedule above; defaults (`revisit_end_fraction: 1`, `revisit_streak_cap: 0`)
+preserve the old constant-weight behavior. PPO excludes overridden actions from
+its policy-gradient loss and entropy bonus;
+the critic still learns from all transitions and recovery costs propagate to
+preceding policy actions through GAE.
+
+Known cells, covered cells, and observed blocked edges merge by logical OR when
+robots are strictly less than `comm_radius` (default 3 m) apart. Memory uses dense
+JAX bitmaps with the same cell-key union semantics as a sparse dictionary;
+exchange is simultaneous and single-hop per physics step. Recovery maintains
+this memory even for legacy actor observations. Controller settings and reward
+weights are saved in new training checkpoints and restored by evaluation and
+visualisation. Old checkpoints without controller settings use the supplied
+configuration and these environment defaults.
+
+MAPPO implements CTDE. The sequential configuration stacks five global frames
+for each critic, including all robots' visit counts and previous visited cells.
+The actor and recovery controller use their execution observations and
+local/shared memory. IPPO deliberately uses a local critic instead.
+
+The `axis_alignment_bonus` rewards actual horizontal or vertical displacement in
+progress and sequential reward modes. It varies smoothly from zero on diagonals
+to its maximum on either axis, scaled by speed and positive progress towards work.
+Stopping, spinning, blocked moves and moving away earn no alignment bonus. Older
+checkpoints without this weight retain a zero bonus; train with the updated
+configuration to learn the preference. Existing lane-reversal bonuses still apply.
+
+The `axis_alignment_cost` penalizes the angular error between each robot's actual
+displacement and the nearest horizontal or vertical direction, in every reward mode.
+Moving at 30° or 60° is a 30° error, and 45° is the maximum. The cost is
+`axis_alignment_cost * (error / 45°)² * speed / v_max`: squaring keeps it smooth at
+the axes, so small drifts are barely penalized, and rotating in place, blocked
+moves and dead robots pay nothing.
+
+Boustrophedon sweeps are shaped on the cell grid in every reward mode. The
+preferred direction is the current lane direction, or the reversal right after
+a one-cell lane shift; its next cell is *open* when the robot's own memory
+holds no wall, wall edge or coverage there:
+
+| Event | Reward |
+|---|---:|
+| New cell straight ahead in the preferred direction | +`sweep_straight_bonus` (3) |
+| New perpendicular neighbour once the next cell is not open (lane shift) | +`sweep_turn_bonus` (3) |
+| Leaving the lane head into any other cell while the next cell is open | −`sweep_break_cost` (5) |
+
+With `sweep_obs: true` (memory_comm only) the actor also observes the preferred
+direction and whether its next cell is open, three values before lidar.
+
+A recovery activation keeps control until its goal cell is covered, by the robot
+or a teammate; uncovered cells discovered on the way no longer release it.
+
+In the visualizer, robots and their lidar rays turn gray while fallback is active
+and return to their individual colors when policy control resumes.

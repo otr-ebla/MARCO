@@ -13,13 +13,12 @@ env:
   sensing_radius: 5.0    # radius within which teammates / humans are visible
   robot_radius: 0.20     # metres, used for collision and spawn clearance
   dt: 0.1                # physics time step (seconds)
-  # Horizon arithmetic: v_max × dt = 0.1 m per step against a 0.5 m cell, so a
-  # robot needs 5 steps to reach a new cell. 302 free cells / 3 robots ≈ 101
-  # cells each × 5 = ~505 steps for a *perfect* sweep with zero overlap and no
-  # turning. 500 was therefore the exact theoretical minimum, i.e. unreachable
-  # in practice; 2000 leaves 4× slack so full coverage is physically possible.
-  max_steps: 4000        # steps before truncation
-  v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
+  # Horizon arithmetic: v_max × dt = 0.03 m per step against a 0.5 m cell, so a
+  # robot needs ~17 steps to reach a new cell. 384 free cells / 3 robots = 128
+  # cells each × 17 ≈ 2130 steps for a *perfect* sweep with zero overlap and no
+  # turning; 5000 leaves ~2.3× slack for turns, transit and recovery.
+  max_steps: 5000        # steps before truncation
+  v_max: 0.3             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
   omega_max: 1.0         # max angular velocity (rad/s)
   # Soft collisions: an attempted move into a wall, robot or human is rejected,
   # the offender pays kappa, and the episode continues.  Making every contact
@@ -30,11 +29,34 @@ env:
   # breaking decentralised execution — this is the key driver of efficient coverage
   use_local_coverage_obs: true
   local_coverage_size: 5    # 5×5 = 25 binary cells centred on the robot
+  # Wrap the crop in a one-cell ring (→ 7×7): each ring cell averages the
+  # robot's own/shared memory over every cell beyond the crop in its direction
+  # (strip on the sides, quadrant in the corners), and an extra extent channel
+  # says how many cells that covers. Legacy crops also gain a memory known
+  # channel. Changes the actor input size: old checkpoints need false.
+  crop_summary: true
+  # CTDE: every robot's value V_i also reads its own crop and all robots' crops.
+  critic_crops: true
+  # Actor: one scalar, covered / known free cells in the robot's own memory.
+  # Critic: one scalar, true global coverage fraction. Both change the network
+  # inputs: checkpoints trained without them need false.
+  known_coverage_obs: true
+  critic_coverage: true
   # Actor observation. "legacy": velocity + teammates + lidar + coverage patch.
   # "memory_comm": each robot builds its own map from lidar
   # (known / occupied / covered) and ORs it with teammates within comm_radius;
   # obs = pose, velocity, id, (id, dx, dy) per comm slot, lidar, 3×5×5 crop.
   obs_mode: legacy
+  sweep_obs: true           # memory_comm: preferred lane dx/dy + next lane cell open
+  fallback_enabled: true
+  fallback_revisit_threshold: 7  # consecutive covered-cell entries
+  fallback_stall_steps: 230      # no discovery (~14 cells of travel at v_max), incl. stopping/spinning
+  fallback_linear_accel: 1.0     # m/s², local DWA velocity window
+  fallback_angular_accel: 2.0    # rad/s²
+  fallback_dwa_steps: 12         # prediction horizon in physics steps
+  fallback_dwa_stall_steps: 30   # switch to a velocity sequence after stalled DWA
+  fallback_sequence_steps: 64   # command buffer; replenished along the A* route
+  fallback_sequence_speed: 0.3  # m/s, <= v_max; each command is guarded by current lidar
   comm_radius: 3.0       # metres; single-hop map exchange per step
   comm_slots: 2          # teammate (id, dx, dy) slots, id 0 = empty
   # reward weights — difference reward: alpha, beta, kappa and psi are charged to
@@ -45,8 +67,8 @@ env:
   # multiplier = 1 + coverage_reward_growth * coverage_ratio.
   # With 2.0, a discovery is worth 1x alpha at 0%, 2x at 50%, 3x near 100%.
   coverage_reward_growth: 2.0
-  # At v_max a robot takes about five steps to cross one cell. Four redundant
-  # steps therefore cost 2.0, leaving new coverage strongly profitable while
+  # At v_max a robot takes about 17 steps to cross one cell (legacy mode only).
+  # Four redundant steps cost 2.0, leaving new coverage strongly profitable while
   # making stationary/repetitive behaviour visible to the optimiser.
   beta: 0.5              # distance travelled through already-covered cells
   # Motion quality. Revisit cost is distance-based in the environment, so the
@@ -106,6 +128,7 @@ train:
   # a constant gradient instead of a growing one.
   huber_delta: 1.0
   n_epochs: 10           # PPO epochs per update
+  num_minibatches: 1     # per epoch, split by environment; raise to fit more envs in GPU memory
   normalize_obs: true    # RunningMeanStd normalisation for stable training
 
 # Weights & Biases dashboards. Every field can be overridden from the command
@@ -127,15 +150,23 @@ e2e_num_maps: 64
 
 # Reward used by src.train_marl. Layout-agnostic: every
 # term uses only the robot's own knowledge (its memory in memory_comm mode).
-# Per step at v_max a robot gains 0.2 cells, so reference magnitudes are:
-#   discovery      ~ +2.0/step (10 per cell, one cell every ~5 steps)
-#   transit        +0.4/step progress, 0 loiter  (driving straight to work)
+# Per step at v_max a robot gains 0.06 cells, so reference magnitudes are:
+#   discovery      ~ +0.6/step (10 per cell, one cell every ~17 steps)
+#   transit        +0.12/step progress, 0 loiter  (driving straight to work)
 #   park / spin    -1.0/step loiter              (no discovery, no progress)
 #   teammate close -0.2/step at contact, 0 beyond spread_radius
+#   teammate in LOS -0.5/step at contact, 0 beyond 5 m, decaying to 10% by step 1500
+#   discovery run  +0.5 x run length per new cell (capped at 10), reset on a covered cell
 e2e_reward:
+  revisit_cost: 1.0          # -c, -2c, -3c per consecutive covered-cell entry
+  fallback_cost: 10.0        # once per successful recovery activation
+  sweep_straight_bonus: 3.0  # new cell straight ahead in the lane (or reversal after a shift)
+  sweep_turn_bonus: 3.0      # lane shift once the cell ahead is a wall or covered
+  sweep_break_cost: 5.0      # leaving the lane head while the cell ahead is still open
   reward_mode: progress
   alpha: 10.0
   coverage_reward_growth: 2.0
+  axis_alignment_cost: 0.15 # (error / 45 degrees)^2, scaled by actual travel speed; per step, so scaled with v_max
   progress_weight: 2.0       # per cell of geodesic approach to believed-uncovered cells
   loiter_cost: 1.0           # per step, scaled by the missing fraction of full-speed progress
   spread_weight: 0.2         # per step and teammate, linear in (1 - d / spread_radius)
@@ -144,5 +175,18 @@ e2e_reward:
   wall_kappa: 2.0
   kappa: 5.0
   human_kappa: 10.0
-  completion_bonus: 200.0
-  completion_time_bonus: 1.0 # completing at step 0 would pay 2x completion_bonus
+  # Paid to every robot when the true global coverage reaches 100%. The time
+  # bonus is off so completion pays exactly this amount.
+  completion_bonus: 100000.0
+  completion_time_bonus: 0.0
+  # Line-of-sight repulsion: per teammate visible through free space (a wall
+  # between the two robots cancels it), max(0, 1 - d / los_spread_radius).
+  # Strong at the start to make the team fan out, then decays linearly.
+  los_spread_weight: 0.5
+  los_spread_radius: 5.0       # = max_lidar_range: the lidar sees who it pays for
+  los_spread_decay_steps: 1500
+  los_spread_end_fraction: 0.1
+  # Incremental run bonus: the k-th consecutive new cell pays
+  # discovery_streak_bonus * min(k, cap); entering a covered cell resets k.
+  discovery_streak_bonus: 0.5
+  discovery_streak_cap: 10

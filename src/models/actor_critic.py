@@ -2,13 +2,13 @@
 
 Actor (decentralised execution): a 1D-CNN compresses the lidar scan, the
 embedding is concatenated with odometry, relative neighbours and the binary
-local-coverage patch, and a small MLP emits the action distribution. There is
-no recurrence: the observation already carries the local coverage state, so a
-GRU only added a serial dependency and a hidden state to carry around.
+local-coverage patch, and a small MLP emits the action distribution. Optional
+personal-map CNN, ordered observation stack and GRU provide spatial and temporal
+context without exposing the critic's privileged map.
 
-Critic (centralised training): a light 2D-CNN reads the per-agent multi-channel
-map [walls, coverage, self, teammates], and the flattened features are
-concatenated with the joint kinematic vector before the value head.
+Critic (centralised training): a light 2D-CNN reads the per-agent global
+map, optionally stacking ordered frames with each robot's visit-count map.
+Frame vectors include joint kinematics and previous visited cells when stacked.
 
 LocalCritic (IPPO): the actor's encoder on the agent's own observation, V(o_i).
 
@@ -36,8 +36,6 @@ _RELU_GAIN = 2.0 ** 0.5
 # everywhere while making divergence impossible.
 _LOG_STD_MIN = -5.0     # sigma = 0.0067
 _LOG_STD_MAX = 1.0      # sigma = 2.72
-# sigmoid(_LOG_STD_RAW_INIT) maps to log_std = 0, i.e. sigma = 1.
-_LOG_STD_RAW_INIT = math.log(-_LOG_STD_MIN / _LOG_STD_MAX)
 
 
 def _dense(features: int, gain: float) -> nn.Dense:
@@ -60,12 +58,20 @@ def _conv(features: int, kernel, strides, padding, gain: float = _RELU_GAIN) -> 
 
 
 def _local_features(obs: jax.Array, vec_dim: int, n_rays: int, tail_dim: int,
-                    lidar_embed: int) -> jax.Array:
+                    lidar_embed: int, memory_map_shape: tuple = (),
+                    observation_stack: int = 1) -> jax.Array:
     """Shared local encoder: [vec | lidar | tail] -> [lidar embedding, vec, tail].
 
     Called from inside a compact module, so the layers it creates belong to
     the caller (names Conv_0, Conv_1, Dense_0 are unchanged for the actor).
     """
+    batch = obs.shape[0]
+    if observation_stack > 1:
+        split = observation_stack * (vec_dim + n_rays)
+        head = obs[:, :split].reshape(batch, observation_stack, vec_dim + n_rays)
+        tail = obs[:, split:].reshape(batch, observation_stack, tail_dim)
+        obs = jnp.concatenate([head, tail], axis=-1).reshape(
+            batch * observation_stack, vec_dim + n_rays + tail_dim)
     vec   = obs[:, :vec_dim]
     lidar = obs[:, vec_dim : vec_dim + n_rays]
     tail  = obs[:, vec_dim + n_rays : vec_dim + n_rays + tail_dim]
@@ -76,7 +82,17 @@ def _local_features(obs: jax.Array, vec_dim: int, n_rays: int, tail_dim: int,
     x = nn.relu(_conv(16, (5,), (2,), 'CIRCULAR')(x))
     x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
     x = nn.relu(_dense(lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
-    return jnp.concatenate([x, vec, tail], axis=-1)
+    if memory_map_shape:
+        channels, height, width = memory_map_shape
+        map_dim = channels * height * width
+        maps = tail[:, -map_dim:].reshape(-1, channels, height, width)
+        maps = jnp.transpose(maps, (0, 2, 3, 1))
+        maps = nn.relu(nn.Conv(16, (3, 3), padding='SAME', name='map_conv_0')(maps))
+        maps = nn.relu(nn.Conv(32, (3, 3), strides=(2, 2), padding='SAME', name='map_conv_1')(maps))
+        maps = nn.relu(nn.Dense(64, name='map_embed')(maps.reshape(maps.shape[0], -1)))
+        tail = jnp.concatenate([tail[:, :-map_dim], maps], axis=-1)
+    features = jnp.concatenate([x, vec, tail], axis=-1)
+    return features.reshape(batch, -1)
 
 
 class Actor(nn.Module):
@@ -97,6 +113,10 @@ class Actor(nn.Module):
     lidar_embed: int = 64
     hidden_size: int = 128
     recurrent: bool = False
+    memory_map_shape: tuple = ()
+    observation_stack: int = 1
+    log_std_min: float = _LOG_STD_MIN
+    log_std_max: float = _LOG_STD_MAX
 
     @nn.compact
     def __call__(self, obs: jax.Array, memory=None):
@@ -107,7 +127,7 @@ class Actor(nn.Module):
             memory  (B, hidden_size), recurrent only
         """
         h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
-                            self.lidar_embed)
+                            self.lidar_embed, self.memory_map_shape, self.observation_stack)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
 
@@ -121,12 +141,14 @@ class Actor(nn.Module):
         # State-independent spread: the MLP predicts only the mean, so no
         # observation can drive sigma. Bounded by construction, see the
         # _LOG_STD_* constants.
+        if not self.log_std_min < 0.0 < self.log_std_max:
+            raise ValueError('log_std_min < 0 < log_std_max is required')
         raw = self.param(
             'log_std_raw',
-            nn.initializers.constant(_LOG_STD_RAW_INIT),
+            nn.initializers.constant(math.log(-self.log_std_min / self.log_std_max)),
             (self.action_dim,),
         )
-        log_std = _LOG_STD_MIN + (_LOG_STD_MAX - _LOG_STD_MIN) * nn.sigmoid(raw)
+        log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * nn.sigmoid(raw)
         if self.recurrent:
             return mean, jnp.broadcast_to(log_std, mean.shape), memory
         return mean, log_std
@@ -136,9 +158,8 @@ class Critic(nn.Module):
     """
     Centralised critic: V_i(s) from the agent-centred global state.
 
-    The map channels [walls, coverage, self, teammates] make the estimate
-    agent-specific, which is what lets each robot get its own advantage while
-    the value still sees the whole team.
+    Agent-centred map channels make each value estimate specific to that
+    robot while still exposing the whole team's state and visit history.
     """
 
     hidden_size: int = 256
@@ -171,12 +192,14 @@ class LocalCritic(nn.Module):
     tail_dim: int = 0
     lidar_embed: int = 64
     hidden_size: int = 256
+    memory_map_shape: tuple = ()
+    observation_stack: int = 1
 
     @nn.compact
     def __call__(self, obs: jax.Array) -> jax.Array:
         """obs : (B, obs_dim) -> value : (B, 1)"""
         h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
-                            self.lidar_embed)
+                            self.lidar_embed, self.memory_map_shape, self.observation_stack)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         return _dense(1, 1.0)(h)

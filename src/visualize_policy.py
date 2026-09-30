@@ -2,8 +2,8 @@
 """Visualise a trained coverage policy in real time using pygame (JAX).
 
 Usage (from the project root):
-    python -m src.test_visual
-    python -m src.test_visual --checkpoint checkpoints/checkpoint_e2e.pkl --episodes 10
+    python -m src.visualize_policy
+    python -m src.visualize_policy --checkpoint checkpoints/checkpoint_e2e.pkl --episodes 10
 
 Playback controls: RIGHT or R skips the current episode, SPACE pauses, L toggles
 LiDAR, S changes speed, and ESC quits.
@@ -68,6 +68,7 @@ COLORS = {
     'border':    ( 30,  30,  30),
     'grid':      (180, 180, 175),
     'lidar':     (255, 165,   0),
+    'fallback':  (120, 120, 120),
     'dead':      (120, 120, 120),
     'hud_bg':    ( 25,  25,  25),
     'hud_text':  (230, 230, 230),
@@ -78,6 +79,14 @@ COLORS = {
     'timeout':   (210,  35, 180),
     'popup_bg':  ( 22,  22,  22),
 }
+
+
+def _robot_color(snap: dict, index: int) -> tuple[int, int, int]:
+    if not snap['alive'][index]:
+        return COLORS['dead']
+    if snap['fallback_active'][index]:
+        return COLORS['fallback']
+    return _ROBOT_COLORS[index % len(_ROBOT_COLORS)]
 
 
 def _to_px(x: float, y: float, map_h: float) -> tuple[int, int]:
@@ -100,6 +109,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         state.human_headings if env.num_humans > 0 else jnp.zeros((0,), jnp.float32),
         state.coverage_grid,
         state.robot_alive,
+        state.fallback_active,
         info['step'],
         info['coverage_ratio'],
         info['covered_cells'],
@@ -111,7 +121,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         env._cast_lidar_all(state)
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
-    (pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio,
+    (pos, hdg, human_pos, human_hdg, grid, alive, fallback_active, step, cov_ratio,
      covered, total, timeout, wall_hits, robot_hits, human_hits,
      lidar) = jax.device_get(payload)
     snap = {
@@ -121,6 +131,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         'human_headings': np.asarray(human_hdg),
         'coverage_grid':  np.asarray(grid),
         'alive':          np.asarray(alive),
+        'fallback_active': np.asarray(fallback_active),
         'step':           int(step),
         'coverage_ratio': float(cov_ratio),
         'covered_cells':  int(covered),
@@ -231,8 +242,7 @@ def _draw_frame(
     if show_lidar and snap['lidar'].size:
         angles_rel = np.linspace(0.0, 2.0 * np.pi, env.n_rays, endpoint=False)
         for i in range(env.num_robots):
-            ray_color = (_ROBOT_COLORS[i % len(_ROBOT_COLORS)] if snap['alive'][i]
-                         else COLORS['dead'])
+            ray_color = _robot_color(snap, i)
             pos    = positions[i]
             angles = headings[i] + angles_rel
             dists  = snap['lidar'][i] * env.max_lidar_range   # stored normalised
@@ -249,8 +259,7 @@ def _draw_frame(
     for i in range(env.num_robots):
         cx, cy = _to_px(positions[i, 0], positions[i, 1], mh)
         hdg    = headings[i]
-        color  = (_ROBOT_COLORS[i % len(_ROBOT_COLORS)] if snap['alive'][i]
-                  else COLORS['dead'])
+        color  = _robot_color(snap, i)
         pygame.draw.circle(surface, color, (cx, cy), r_px)
         tip_x = cx + int(r_px * 1.8 * np.cos(hdg))
         tip_y = cy - int(r_px * 1.8 * np.sin(hdg))
@@ -460,8 +469,15 @@ def _load_checkpoint(
 
     if env_config is not None:
         env_config.update(ckpt.get("reward_weights", {}))
+        env_config.update({"use_full_memory": False, "observation_stack": 1, "sweep_obs": False,
+                           "crop_summary": False, "critic_crops": False,
+                           "known_coverage_obs": False, "critic_coverage": False,
+                           "goal_obs": False, "wall_cells": 0,
+                           "history_cell": "last_discovery", "critic_context": False,
+                           "critic_stack": 1})
         env_config.update(ckpt.get("obs_config", {"obs_mode": "legacy"}))
         env_config["actor_recurrent"] = bool(ckpt.get("actor_recurrent", False))
+        env_config["actor_config"] = ckpt.get("actor_config", {})
 
     params = jax.device_put(ckpt['actor_params'], device)
     rms = None
@@ -491,6 +507,10 @@ def main() -> None:
                         help=f'Rendering FPS (default: {FPS})')
     parser.add_argument('--seed',       type=int, default=0,
                         help='PRNG seed for episode resets (default: 0)')
+    parser.add_argument('--policy-only', action='store_true',
+                        help='Disable recovery after restoring checkpoint settings')
+    parser.add_argument('--wall-cells', type=int, default=None,
+                        help='Override checkpoint geometry: 0 = original thin walls, 1 = full-cell walls')
     parser.add_argument('--no-obs-norm', action='store_true',
                         help='Disable observation normalisation')
     parser.add_argument('--backend',    default='cpu',
@@ -506,6 +526,8 @@ def main() -> None:
 
     if args.layouts < 2:
         parser.error('--layouts must be at least 2 so RIGHT can select a new layout')
+    if args.wall_cells is not None and args.wall_cells < 0:
+        parser.error('--wall-cells must be non-negative')
 
     config    = load_config(args.config)
     env_cfg   = config.get('env',   {})
@@ -525,17 +547,25 @@ def main() -> None:
         env_cfg = {**env_cfg, 'max_steps': args.max_steps}
 
     params, obs_rms, update = _load_checkpoint(args.checkpoint, device, env_cfg)
+    if args.wall_cells is not None:
+        env_cfg['wall_cells'] = args.wall_cells
+    if args.policy_only:
+        env_cfg['fallback_enabled'] = False
     print(f"Loaded: {args.checkpoint}  (update {update})")
 
     env = MultiRobotCoverageEnv(env_cfg)
+    actor_cfg = dict(lidar_embed=model_cfg.get('lidar_embed', 64),
+                     hidden_size=model_cfg.get('hidden_size', 128))
+    actor_cfg.update(env_cfg.get('actor_config', {}))
     actor = Actor(
         recurrent=env_cfg.get("actor_recurrent", False),
         action_dim=env.action_dim,
         vec_dim=env.obs_vec_dim,
         n_rays=env.n_rays,
         tail_dim=env.patch_dim,
-        lidar_embed=model_cfg.get('lidar_embed',  64),
-        hidden_size=model_cfg.get('hidden_size', 128),
+        memory_map_shape=env.memory_map_shape,
+        observation_stack=env.observation_stack,
+        **actor_cfg,
     )
 
     if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
