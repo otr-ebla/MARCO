@@ -68,14 +68,18 @@ class ExpertTests(unittest.TestCase):
         cls.expert = BCDExpert(cls.vec.env)
 
     def test_expert_alone_covers_the_maps_without_wall_contact(self):
-        state, _, _, _ = self.vec.reset(jax.random.PRNGKey(3), jnp.arange(4))
-        run = expert_steps(self.expert, self.vec, 1000)
-        carry = (state, self.expert.init_chunks((4,)))
+        # A neighbour cell needs 80% of the radius inside it, so the expert
+        # must drive over nearly every cell: allow a longer horizon.
+        vec = VecEnv(4, {**CONFIG, 'max_steps': 6000})
+        expert = BCDExpert(vec.env)
+        state, _, _, _ = vec.reset(jax.random.PRNGKey(3), jnp.arange(4))
+        run = expert_steps(expert, vec, 1000)
+        carry = (state, expert.init_chunks((4,)))
         stats = []
-        for _ in range(4):
+        for _ in range(6):
             carry, out = run(carry)
             stats.append(jax.device_get(out))
-        s = first_episode_summary({k: np.concatenate([o[k] for o in stats]) for k in stats[0]}, 4000)
+        s = first_episode_summary({k: np.concatenate([o[k] for o in stats]) for k in stats[0]}, 6000)
         self.assertGreater(s['coverage'].mean(), .98)
         self.assertEqual(s['wall'].sum(), 0.)
 

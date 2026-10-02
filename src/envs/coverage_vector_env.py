@@ -166,7 +166,7 @@ class MultiRobotCoverageEnv:
         self.robot_radius    = float(cfg.get('robot_radius',    0.20))
         # A neighbouring cell counts as covered once the disk enters it by
         # this fraction of the radius; the centre cell is always covered.
-        self.coverage_overlap = float(cfg.get('coverage_overlap', 0.3))
+        self.coverage_overlap = float(cfg.get('coverage_overlap', 0.8))
         if not 0.0 <= self.coverage_overlap <= 1.0:
             raise ValueError('coverage_overlap must be in [0, 1]')
         self.dt              = float(cfg.get('dt',              0.1))
