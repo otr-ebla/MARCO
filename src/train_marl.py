@@ -19,6 +19,8 @@ import argparse
 import csv
 import os
 import pickle
+import subprocess
+import sys
 from typing import NamedTuple
 
 import jax
@@ -479,6 +481,22 @@ def bc_coefficient(update: int, start: float, decay_updates: int) -> float:
     return start * max(0.0, 1.0 - (update - 1) / decay_updates)
 
 
+def start_live_plot(log_path: str) -> None:
+    """Open a window that follows the reward column of the training log."""
+    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+            or sys.platform in ('darwin', 'win32')):
+        print('Live plot disabled: no display available')
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, '-m', 'src.live_plot', log_path],
+            cwd=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'),
+        )
+        print(f"Live plot: following {log_path}")
+    except OSError as exc:
+        print(f"Live plot disabled: {exc}")
+
+
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None,
           wandb_overrides: dict | None = None, num_humans: int = 0,
@@ -486,7 +504,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
           num_minibatches: int | None = None,
           num_maps: int | None = None,
           additional_updates: int | None = None,
-          obs_mode: str | None = None, algo: str = "mappo"):
+          obs_mode: str | None = None, algo: str = "mappo",
+          live_plot: bool = True):
     if policy_mode not in ('end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     if algo not in ('mappo', 'ippo'):
@@ -630,6 +649,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'policy_fraction', 'sequence_fraction', 'sequence_override_fraction',
                                 'recovery_imitation_loss', 'teacher_fraction',
                                 'bc_loss', 'bc_coef'])
+    if live_plot:
+        start_live_plot(log_path)
 
     best_policy_score = None
 
@@ -879,6 +900,8 @@ if __name__ == '__main__':
                              'comm_radius')
     parser.add_argument('--additional-updates', type=int, default=None,
                         help='When resuming, run exactly this many extra updates')
+    parser.add_argument('--no-live-plot', dest='live_plot', action='store_false',
+                        help='Do not open the live mean-episode-reward plot window')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -893,4 +916,4 @@ if __name__ == '__main__':
           num_minibatches=args.minibatches,
           policy_mode=args.policy_mode, num_maps=args.maps,
           additional_updates=args.additional_updates,
-          obs_mode=args.obs_mode, algo=args.algo)
+          obs_mode=args.obs_mode, algo=args.algo, live_plot=args.live_plot)
