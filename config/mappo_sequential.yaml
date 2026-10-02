@@ -119,8 +119,15 @@ e2e_reward:
   progress_weight: 2.0
   # Allow necessary turns; coverage and progress remain the main incentives.
   loiter_cost: 0.2
-  spread_weight: 0.5
-  spread_radius: 2.5
+  # Teammate repulsion, per step and teammate: weight * max(0, 1 - d / radius).
+  # spread_* counts only comm-slot teammates (radius <= comm_radius);
+  # los_spread_* counts any teammate in line of sight within lidar range.
+  spread_weight: 2.0
+  spread_radius: 3.0
+  los_spread_weight: 1.5
+  los_spread_radius: 5.0
+  los_spread_decay_steps: 1500
+  los_spread_end_fraction: 0.3
   tau: 0.02
   wall_kappa: 2.0
   kappa: 5.0

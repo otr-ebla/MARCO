@@ -4,6 +4,7 @@
 Usage (from the project root):
     python -m src.visualize_policy
     python -m src.visualize_policy --checkpoint checkpoints/checkpoint_e2e.pkl --episodes 10
+    python -m src.visualize_policy --config config/mappo_sequential.yaml --expert [--target-rule tour]
 
 Playback controls: RIGHT or R skips the current episode, SPACE pauses, L toggles
 LiDAR, S changes speed, and ESC quits.
@@ -351,6 +352,31 @@ class MappoController:
         return state, rewards, terminated, truncated
 
 
+class ExpertController:
+    """BCD expert (src.envs.bcd_expert) driving every robot; no checkpoint needed."""
+
+    def __init__(self, env: MultiRobotCoverageEnv, expert_config: dict):
+        from src.envs.bcd_expert import BCDExpert
+        self.expert = BCDExpert(env, expert_config)
+        self.label = f'BCD expert ({self.expert.target_rule}) '
+
+        @jax.jit
+        def expert_step(state, chunk):
+            action, chunk, _ = self.expert.act(state, chunk)
+            next_state, rewards, terminated, truncated = env.step(state, action)
+            return next_state, chunk, rewards, terminated, truncated
+
+        self._fn = expert_step
+
+    def reset(self, state):
+        self.chunk = self.expert.init_chunks()   # reassigned at step 0
+        return state
+
+    def step(self, state):
+        state, self.chunk, rewards, terminated, truncated = self._fn(state, self.chunk)
+        return state, rewards, terminated, truncated
+
+
 def run_episode(
     env: MultiRobotCoverageEnv,
     controller,
@@ -518,6 +544,11 @@ def main() -> None:
                         help='JAX backend. Default "cpu": a single-env rollout is '
                              'tiny, so the CPU beats accelerator launch overhead')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
+    parser.add_argument('--expert', action='store_true',
+                        help='Drive the robots with the BCD expert (config pretrain.expert) '
+                             'instead of a checkpoint; recovery is disabled')
+    parser.add_argument('--target-rule', choices=['local', 'tour'], default=None,
+                        help='With --expert: override pretrain.expert.target_rule')
     parser.add_argument('--terminate-on-collision',
                         action=argparse.BooleanOptionalAction, default=None,
                         help='Override collision termination; default uses the '
@@ -546,6 +577,25 @@ def main() -> None:
     if args.max_steps > 0:
         env_cfg = {**env_cfg, 'max_steps': args.max_steps}
 
+    if args.expert:
+        from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
+        # The training environment: e2e reward weights, the expert in place of recovery.
+        env_cfg.update({**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})})
+        if args.wall_cells is not None:
+            env_cfg['wall_cells'] = args.wall_cells
+        env_cfg['fallback_enabled'] = False
+        env = MultiRobotCoverageEnv(env_cfg)
+        expert_cfg = dict(config.get('pretrain', {}).get('expert', {}))
+        if args.target_rule is not None:
+            expert_cfg['target_rule'] = args.target_rule
+        controller = ExpertController(env, expert_cfg)
+        print(f"Controller: {controller.label.strip()}")
+    else:
+        env, controller = _policy_controller(args, env_cfg, model_cfg, train_cfg, device)
+    _run_viewer(args, env, controller)
+
+
+def _policy_controller(args, env_cfg, model_cfg, train_cfg, device):
     params, obs_rms, update = _load_checkpoint(args.checkpoint, device, env_cfg)
     if args.wall_cells is not None:
         env_cfg['wall_cells'] = args.wall_cells
@@ -575,9 +625,10 @@ def main() -> None:
         print("Warning: checkpoint has no obs_rms — running without normalisation.")
     else:
         print("Observation normalisation: loaded from checkpoint.")
-    controller = MappoController(env, actor, params, obs_rms)
+    return env, MappoController(env, actor, params, obs_rms)
 
-    # -- Pygame setup --    # -- Pygame setup --
+
+def _run_viewer(args, env, controller) -> None:
     # -- Pygame setup --
     mw    = env.grid_w * env.cell_size
     mh    = env.grid_h * env.cell_size
