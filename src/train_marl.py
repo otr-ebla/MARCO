@@ -156,6 +156,7 @@ class RolloutCarry(NamedTuple):
     smoothed_col_rate: jax.Array
     smoothed_coverage_rate: jax.Array
     memory: object = None
+    expert_chunk: object = None   # (E, N) BCD chunk per robot, when an expert labels steps
 
 
 class DeviceEpisodeStats(NamedTuple):
@@ -253,9 +254,15 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
 
 
 class Rollout:
-    def __init__(self, mappo: MAPPO, vec_env: VecEnv):
+    def __init__(self, mappo: MAPPO, vec_env: VecEnv, expert=None, expert_local: bool = True):
+        """With a BCDExpert, every step also stores the expert's action at the
+        visited state (`expert_action`) for the decaying behaviour-cloning loss;
+        with `expert_local`, only where the expert's target is inside the crop."""
         self.mappo = mappo
         self.env = vec_env
+        self.expert = expert
+        expert_act = None if expert is None else jax.vmap(expert.act)
+        local_fn = None if expert is None else jax.vmap(expert.local)
         e, n = vec_env.E, vec_env.num_robots
 
         @jax.jit
@@ -287,11 +294,17 @@ class Rollout:
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
                 (state, obs, gstate, rms, episode_stats,
-                 smoothed_col_rate, smoothed_coverage_rate, memory) = c
-                
+                 smoothed_col_rate, smoothed_coverage_rate, memory, chunk) = c
+
                 obs_n, action, z, log_prob, value, rms, next_memory = act(
                     actor_params, critic_params, rms, obs, gstate, k, memory
                 )
+                expert_action = expert_mask = None
+                if expert_act is not None:
+                    expert_action, chunk, _ = expert_act(state, chunk)
+                    expert_mask = state.robot_alive.astype(jnp.float32)
+                    if expert_local:
+                        expert_mask = expert_mask * local_fn(state, chunk)
                 (next_state, next_obs, reward, term, done, info,
                  next_gstate) = vec_env.step(state, action)
 
@@ -321,15 +334,18 @@ class Rollout:
                     safety_override=info['fallback_safety_override'].astype(jnp.float32),
                     teacher_action=info['executed_action'],
                     teacher_mask=info['teacher_mask'],
+                    expert_action=expert_action,
+                    expert_mask=expert_mask,
                 )
 
                 episode_stats = _episode_stats_step(
                     episode_stats, trans, self.mappo.reward_scale, info['recoverage']
                 )
-                
+
                 next_carry = RolloutCarry(
                     next_state, next_obs, next_gstate, rms,
                     episode_stats, smoothed_col_rate, smoothed_coverage_rate, next_memory,
+                    chunk,
                 )
                 return next_carry, trans
                 
@@ -347,7 +363,7 @@ class Rollout:
         return RolloutCarry(
             state, obs, gstate, rms_init(self.env.norm_dim),
             _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
-            memory,
+            memory, None if self.expert is None else self.expert.init_chunks((E,)),
         )
 
     def run(self, actor_params, critic_params, carry: RolloutCarry, num_steps: int, key: jax.Array):
@@ -367,25 +383,12 @@ def policy_checkpoint_score(completion, coverage, contacts, reward):
     return (completion, coverage, -contacts, reward)
 
 
-def train(config_path: str, save_dir: str, resume: str | None,
-          backend: str | None = None,
-          wandb_overrides: dict | None = None, num_humans: int = 0,
-          num_envs: int | None = None, policy_mode: str = "end-to-end",
-          num_minibatches: int | None = None,
-          num_maps: int | None = None,
-          additional_updates: int | None = None,
-          obs_mode: str | None = None, algo: str = "mappo"):
-    if policy_mode not in ('end-to-end', 'end-to-end-memory'):
-        raise ValueError(f'Unknown policy mode: {policy_mode}')
-    if algo not in ('mappo', 'ippo'):
-        raise ValueError(f'Unknown algo: {algo}')
-    config = load_config(config_path)
-    if obs_mode is not None:
-        config.setdefault('env', {})['obs_mode'] = obs_mode
-    device = select_device(backend)
-    print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
-
+def build_env_config(config: dict, num_maps: int | None = None, num_humans: int = 0,
+                     obs_mode: str | None = None) -> tuple[dict, dict]:
+    """Environment config and reward weights exactly as training uses them."""
     env_cfg = config.setdefault('env', {})
+    if obs_mode is not None:
+        env_cfg['obs_mode'] = obs_mode
     env_cfg['num_maps'] = int(
         num_maps if num_maps is not None
         else config.get('e2e_num_maps', env_cfg.get('num_maps', 16))
@@ -395,30 +398,13 @@ def train(config_path: str, save_dir: str, resume: str | None,
     if unknown:
         raise ValueError(f'Unknown e2e_reward keys: {sorted(unknown)}')
     env_cfg.update(reward_weights)
-    checkpoint_name = 'checkpoint_e2e.pkl'
-    latest_name = 'checkpoint_e2e_latest.pkl'
-    log_name = 'training_log_e2e.csv'
-    if policy_mode == 'end-to-end-memory':
-        checkpoint_name = 'checkpoint_e2e_memory.pkl'
-        latest_name = 'checkpoint_e2e_memory_latest.pkl'
-        log_name = 'training_log_e2e_memory.csv'
     if num_humans > 0:
         env_cfg['num_humans'] = num_humans
-    model_cfg = config.get('model', {})
-    train_cfg = config.get('train', {})
-    
-    if num_envs is not None:
-        train_cfg['num_envs'] = num_envs
-    if num_minibatches is not None:
-        train_cfg['num_minibatches'] = num_minibatches
+    return env_cfg, reward_weights
 
-    vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
-    env        = vec_env.env
-    E          = vec_env.E
-    N          = vec_env.num_robots
-    action_dim = vec_env.action_dim
-    tail_dim = env.patch_dim
-    obs_dim = env.obs_dim
+
+def observation_config(env) -> dict:
+    """Env keys that fix the actor's input layout and the recovery controller."""
     obs_config = {'obs_mode': env.obs_mode, 'use_full_memory': env.use_full_memory,
                   'observation_stack': env.observation_stack,
                   'num_robots': env.num_robots, 'n_rays': env.n_rays,
@@ -442,13 +428,98 @@ def train(config_path: str, save_dir: str, resume: str | None,
     if env.use_memory:
         obs_config.update(comm_radius=env.comm_radius, comm_slots=env.comm_slots,
                           local_coverage_size=env.local_coverage_size)
+    return obs_config
 
+
+def build_learner(vec_env: VecEnv, model_cfg: dict, train_cfg: dict, policy_mode: str,
+                  algo: str, device) -> tuple[MAPPO, dict]:
+    """Actor, critic and PPO learner; returns (learner, actor_config)."""
+    env = vec_env.env
     lidar_embed = model_cfg.get('lidar_embed',  64)
     hidden_size = model_cfg.get('hidden_size', 128)
     actor_config = dict(lidar_embed=lidar_embed, hidden_size=hidden_size,
                         log_std_min=model_cfg.get('log_std_min', -5.0),
                         log_std_max=model_cfg.get('log_std_max', 1.0))
-    trunk_in    = lidar_embed + env.obs_vec_dim + tail_dim
+    actor = Actor(
+        recurrent=policy_mode == "end-to-end-memory",
+        action_dim=vec_env.action_dim,
+        vec_dim=env.obs_vec_dim,
+        n_rays=env.n_rays,
+        tail_dim=env.patch_dim,
+        memory_map_shape=env.memory_map_shape,
+        observation_stack=env.observation_stack,
+        **actor_config,
+    )
+    if algo == 'ippo':
+        critic = LocalCritic(
+            vec_dim=env.obs_vec_dim,
+            n_rays=env.n_rays,
+            tail_dim=env.patch_dim,
+            memory_map_shape=env.memory_map_shape,
+            observation_stack=env.observation_stack,
+            lidar_embed=lidar_embed,
+            hidden_size=model_cfg.get('critic_hidden', 256),
+        )
+    else:
+        critic = Critic(
+            hidden_size=model_cfg.get('critic_hidden',    256),
+            map_embed=model_cfg.get('critic_map_embed', 128),
+        )
+    mappo = (IPPO if algo == 'ippo' else MAPPO)(
+        actor, critic, vec_env, train_cfg, device=device
+    )
+    mappo.env = vec_env
+    return mappo, actor_config
+
+
+def bc_coefficient(update: int, start: float, decay_updates: int) -> float:
+    """Linear decay of the behaviour-cloning weight from `start` to zero."""
+    if start <= 0 or decay_updates <= 0:
+        return 0.0
+    return start * max(0.0, 1.0 - (update - 1) / decay_updates)
+
+
+def train(config_path: str, save_dir: str, resume: str | None,
+          backend: str | None = None,
+          wandb_overrides: dict | None = None, num_humans: int = 0,
+          num_envs: int | None = None, policy_mode: str = "end-to-end",
+          num_minibatches: int | None = None,
+          num_maps: int | None = None,
+          additional_updates: int | None = None,
+          obs_mode: str | None = None, algo: str = "mappo"):
+    if policy_mode not in ('end-to-end', 'end-to-end-memory'):
+        raise ValueError(f'Unknown policy mode: {policy_mode}')
+    if algo not in ('mappo', 'ippo'):
+        raise ValueError(f'Unknown algo: {algo}')
+    config = load_config(config_path)
+    device = select_device(backend)
+    print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
+
+    env_cfg, reward_weights = build_env_config(config, num_maps, num_humans, obs_mode)
+    checkpoint_name = 'checkpoint_e2e.pkl'
+    latest_name = 'checkpoint_e2e_latest.pkl'
+    log_name = 'training_log_e2e.csv'
+    if policy_mode == 'end-to-end-memory':
+        checkpoint_name = 'checkpoint_e2e_memory.pkl'
+        latest_name = 'checkpoint_e2e_memory_latest.pkl'
+        log_name = 'training_log_e2e_memory.csv'
+    model_cfg = config.get('model', {})
+    train_cfg = config.get('train', {})
+    
+    if num_envs is not None:
+        train_cfg['num_envs'] = num_envs
+    if num_minibatches is not None:
+        train_cfg['num_minibatches'] = num_minibatches
+
+    vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
+    env        = vec_env.env
+    E          = vec_env.E
+    N          = vec_env.num_robots
+    action_dim = vec_env.action_dim
+    tail_dim = env.patch_dim
+    obs_dim = env.obs_dim
+    obs_config = observation_config(env)
+    trunk_in    = model_cfg.get('lidar_embed', 64) + env.obs_vec_dim + tail_dim
 
     print(f"Parallel envs: {E}  |  robots/env: {N}  |  obs_dim: {obs_dim} "
           f"({env.obs_dim} env)  |  critic map: "
@@ -468,35 +539,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     if env.fallback_enabled:
         print('Training coverage includes recovery; use evaluate_policies --compare-policy-only to measure autonomous coverage.')
 
-    actor = Actor(
-        recurrent=policy_mode == "end-to-end-memory",
-        action_dim=action_dim,
-        vec_dim=env.obs_vec_dim,
-        n_rays=env.n_rays,
-        tail_dim=tail_dim,
-        memory_map_shape=env.memory_map_shape,
-        observation_stack=env.observation_stack,
-        **actor_config,
-    )
-    if algo == 'ippo':
-        critic = LocalCritic(
-            vec_dim=env.obs_vec_dim,
-            n_rays=env.n_rays,
-            tail_dim=tail_dim,
-            memory_map_shape=env.memory_map_shape,
-            observation_stack=env.observation_stack,
-            lidar_embed=lidar_embed,
-            hidden_size=model_cfg.get('critic_hidden', 256),
-        )
-    else:
-        critic = Critic(
-            hidden_size=model_cfg.get('critic_hidden',    256),
-            map_embed=model_cfg.get('critic_map_embed', 128),
-        )
-    mappo = (IPPO if algo == 'ippo' else MAPPO)(
-        actor, critic, vec_env, train_cfg, device=device
-    )
-    mappo.env = vec_env
+    mappo, actor_config = build_learner(vec_env, model_cfg, train_cfg, policy_mode, algo, device)
     print(f"Algorithm: {algo.upper()} ("
           f"{'local critic V(o_i)' if algo == 'ippo' else 'centralised critic V_i(s)'}"
           f", shared actor and critic parameters)")
@@ -510,6 +553,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
     lr_decay      = train_cfg.get('lr_decay',       True)
     lr_actor_0    = train_cfg.get('lr_actor',       3e-4)
     lr_critic_0   = train_cfg.get('lr_critic',      1e-3)
+    # Decaying behaviour cloning towards the BCD expert (see src/pretrain_bc.py).
+    bc_coef_0     = float(train_cfg.get('bc_coef',      0.0))
+    bc_decay      = int(train_cfg.get('bc_decay_updates', 300))
 
     key = jax.random.PRNGKey(train_cfg.get('seed', 0))
     key, init_key, reset_key = jax.random.split(key, 3)
@@ -517,7 +563,15 @@ def train(config_path: str, save_dir: str, resume: str | None,
     actor_state, critic_state = mappo.create_train_states(init_key)
 
     print(f"Maps: {env.grid_h}x{env.grid_w} cells, sampled independently on reset")
-    rollout = Rollout(mappo, vec_env)
+    expert = None
+    if bc_coef_0 > 0:
+        from src.envs.bcd_expert import BCDExpert
+        pretrain_cfg = config.get('pretrain', {})
+        expert = BCDExpert(env, pretrain_cfg.get('expert', {}))
+        print(f"BC towards the BCD expert: coefficient {bc_coef_0} decaying to 0 "
+              f"over {bc_decay} updates")
+    rollout = Rollout(mappo, vec_env, expert,
+                      bool(pretrain_cfg.get('local_labels', True)) if expert else True)
     carry = rollout.start(reset_key)
 
     os.makedirs(save_dir, exist_ok=True)
@@ -574,7 +628,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'human_collisions_per_episode',
                                 'actor_loss', 'critic_loss', 'entropy', 'std', 'approx_kl', 'clip_fraction', 'actor_update_fraction',
                                 'policy_fraction', 'sequence_fraction', 'sequence_override_fraction',
-                                'recovery_imitation_loss', 'teacher_fraction'])
+                                'recovery_imitation_loss', 'teacher_fraction',
+                                'bc_loss', 'bc_coef'])
 
     best_policy_score = None
 
@@ -608,8 +663,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
         advantages, returns = compute_gae(traj, last_value, gamma, gae_lambda)
 
+        bc_coef = bc_coefficient(update, bc_coef_0, bc_decay)
         actor_state, critic_state, metrics = mappo.update(
-            actor_state, critic_state, traj, advantages, returns, lr_a, lr_c
+            actor_state, critic_state, traj, advantages, returns, lr_a, lr_c, bc_coef
         )
 
         # ----------------------------------------------------------------
@@ -674,6 +730,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 f"actor_updates={float(losses['actor_update_fraction']):.1%} | "
                 f"imitation={float(losses['recovery_imitation_loss']):.4f} | "
                 f"teacher={float(losses['teacher_fraction']):.1%} | "
+                f"bc={float(losses['bc_loss']):.4f}x{bc_coef:.3f} | "
                 f"policy={policy_fraction:.1%} | sequence={sequence_fraction:.1%} | "
                 f"seq_blocked={override_fraction:.1%} | "
                 f"rr={robot_rate:6.2%} | "
@@ -707,6 +764,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     round(policy_fraction, 6), round(sequence_fraction, 6), round(override_fraction, 6),
                     round(float(losses['recovery_imitation_loss']), 6),
                     round(float(losses['teacher_fraction']), 6),
+                    round(float(losses['bc_loss']), 6), round(bc_coef, 6),
                 ])
             if run is not None:
                 wandb.log({
@@ -731,6 +789,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'loss/critic':                    float(losses['critic_loss']),
                     'loss/recovery_imitation':        float(losses['recovery_imitation_loss']),
                     'control/teacher_fraction':       float(losses['teacher_fraction']),
+                    'loss/bc':                        float(losses['bc_loss']),
+                    'loss/bc_coef':                   bc_coef,
                     'loss/entropy':                   float(losses['entropy']),
                     'policy/std':                     float(losses['std']),
                     'policy/approx_kl':               float(losses['approx_kl']),
@@ -755,9 +815,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 tail_dim, policy_mode, reward_weights,
                                 obs_config, algo, actor_config)
                 print(
-                    f"  → best policy saved (complete={completion_rate:.2%}, "
+                    f"\n  → BEST POLICY SAVED (complete={completion_rate:.2%}, "
                     f"coverage={mean_ep_cov:.2%}, contacts/ep="
-                    f"{ep_wall_mean + ep_robot_mean + ep_human_mean:.2f})"
+                    f"{ep_wall_mean + ep_robot_mean + ep_human_mean:.2f})\n"
                 )
                 if run is not None:
                     run.summary['best_mean_ep_reward'] = mean_ep_r

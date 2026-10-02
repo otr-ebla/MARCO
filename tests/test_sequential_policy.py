@@ -99,13 +99,13 @@ class SequentialPolicyTests(unittest.TestCase):
         state = self.state.replace(last_discovery=jnp.array([[2, 2]] * 3),
                                    sweep_direction=jnp.array([[1, 0]] * 3))
         # Straight, turn, jump over a cell.
-        pos = (jnp.array([[3, 2], [2, 3], [4, 2]]) + 0.5) * env.cell_size
-        bonus = env._sequential_discovery_reward(state, pos, jnp.ones(3, bool))
+        cells = jnp.array([[3, 2], [2, 3], [4, 2]])
+        bonus = env._sequential_discovery_reward(state, cells, jnp.ones(3, bool))
         np.testing.assert_array_equal(bonus, [3, 2, 0])
         np.testing.assert_array_equal(
-            env._sequential_discovery_reward(state, pos, jnp.zeros(3, bool)), 0)
+            env._sequential_discovery_reward(state, cells, jnp.zeros(3, bool)), 0)
         np.testing.assert_array_equal(
-            env._sequential_discovery_reward(self.state, pos, jnp.ones(3, bool)), 0)
+            env._sequential_discovery_reward(self.state, cells, jnp.ones(3, bool)), 0)
 
     def test_known_work_takes_priority_over_covered_frontier(self):
         env, walls = self.env, self.env.wall_grids
@@ -220,8 +220,26 @@ class SweepRewardTests(unittest.TestCase):
         state, _, _, _ = jax.jit(env.step)(state, jnp.array([[-1., 0.]] * 3))
         info = env.get_info(state)
         self.assertEqual(float(info['cell_entries']), 3.)
-        self.assertEqual(float(info['covered_cells']), 2.)
-        self.assertEqual(float(info['recoverage']), 1.5)
+        # The first two disks straddle cell corners: 4 cells each, sharing
+        # (2, 2); the third lies inside one cell.
+        self.assertEqual(float(info['covered_cells']), 8.)
+        self.assertEqual(float(info['recoverage']), 3. / 8.)
+
+    def test_neighbour_needs_thirty_percent_of_radius(self):
+        env = MultiRobotCoverageEnv(CONFIG)
+        reach = 0.7 * env.robot_radius
+        # Robot 0 enters cell (col 3, row 2) by just under 30% of its radius,
+        # robot 2 enters (col 3, row 6) by just over it.
+        state = env.reset(jax.random.PRNGKey(5)).replace(robot_positions=jnp.array(
+            [[1.5 - reach - 0.01, 1.25], [4.25, 4.25], [1.5 - reach + 0.01, 3.25]]))
+        state = state.replace(coverage_grid=jnp.zeros_like(state.coverage_grid))
+        state, _, _, _ = jax.jit(env.step)(state, jnp.array([[-1., 0.]] * 3))
+        grid = np.asarray(state.coverage_grid)
+        self.assertEqual(grid[2, 2], 1.)
+        self.assertEqual(grid[2, 3], 0.)
+        self.assertEqual(grid[6, 2], 1.)
+        self.assertEqual(grid[6, 3], 1.)
+        self.assertEqual(grid.sum(), 4.)
 
     def test_recoverage_survives_autoreset_in_info_and_episode_ring(self):
         vec = VecEnv(2, {**CONFIG, 'max_steps': 1})

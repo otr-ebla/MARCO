@@ -126,6 +126,8 @@ class Transition(NamedTuple):
     safety_override: object = None # (T, E, N), sequence interrupted by live scan
     teacher_action: object = None # executed recovery command, never used as a PPO sample
     teacher_mask: object = None   # collision-free, nonstationary recovery steps
+    expert_action: object = None  # (T, E, N, 2) BCD expert label at the visited state
+    expert_mask: object = None    # (T, E, N), 1 where the expert label is valid
 
 
 class RolloutCarry(NamedTuple):
@@ -463,6 +465,7 @@ class MAPPO:
         returns: jax.Array,
         lr_actor: jax.Array,
         lr_critic: jax.Array,
+        bc_coef: jax.Array,
     ) -> tuple[TrainState, TrainState, dict]:
         t, e, n = traj.obs.shape[0], traj.obs.shape[1], traj.obs.shape[2]
         num_mb = self.num_minibatches
@@ -486,6 +489,8 @@ class MAPPO:
             None if traj.memory is None else traj.memory.reshape(t, e, n, -1),
             jnp.zeros_like(traj.action) if traj.teacher_action is None else traj.teacher_action,
             jnp.zeros_like(policy_mask) if traj.teacher_mask is None else traj.teacher_mask,
+            jnp.zeros_like(traj.action) if traj.expert_action is None else traj.expert_action,
+            jnp.zeros_like(policy_mask) if traj.expert_mask is None else traj.expert_mask,
         )
 
         def select(env_idx):
@@ -497,7 +502,7 @@ class MAPPO:
         def minibatch(carry, env_idx):
             a_state, c_state, actor_enabled = carry
             (obs, gstate, action, z, log_prob, done, adv_b, returns_b, mask_b,
-             memory, teacher_action, teacher_mask) = select(env_idx)
+             memory, teacher_action, teacher_mask, expert_action, expert_mask) = select(env_idx)
 
             # Feed-forward actors consume this flat batch directly. Recurrent
             # actors use the ordered trajectory and flatten only their outputs
@@ -526,7 +531,11 @@ class MAPPO:
                     mean, log_std = self.actor.apply(params, obs_f)
                 loss, diagnostics = ppo_loss(mean, log_std, z_f, act_f, old_log_prob, adv_f, mask_b.reshape(flat))
                 imitation = recovery_imitation_loss(mean, teacher_action.reshape(flat, -1), teacher_mask.reshape(flat))
-                return loss + self.recovery_imitation_coef * imitation, (*diagnostics, imitation)
+                # Decaying behaviour cloning towards the BCD expert, on the
+                # states the current policy visits.
+                bc = recovery_imitation_loss(mean, expert_action.reshape(flat, -1), expert_mask.reshape(flat))
+                return (loss + self.recovery_imitation_coef * imitation + bc_coef * bc,
+                        (*diagnostics, imitation, bc))
 
             def critic_loss_fn(params):
                 values = self.critic.apply(params, *critic_args).squeeze(-1)
@@ -542,13 +551,14 @@ class MAPPO:
                     optax.huber_loss(values, returns_f, delta=self.huber_delta)
                 )
 
-            (_, (a_loss, entropy, std, approx_kl, clip_fraction, imitation)), a_grads = jax.value_and_grad(
+            (_, (a_loss, entropy, std, approx_kl, clip_fraction, imitation, bc)), a_grads = jax.value_and_grad(
                 actor_loss_fn, has_aux=True
             )(a_state.params)
             actor_enabled = actor_enabled & ((self.target_kl <= 0)
                                              | (approx_kl <= self.target_kl))
             actor_updated = actor_enabled & (jnp.any(mask_b > 0)
-                | ((self.recovery_imitation_coef > 0) & jnp.any(teacher_mask > 0)))
+                | ((self.recovery_imitation_coef > 0) & jnp.any(teacher_mask > 0))
+                | ((bc_coef > 0) & jnp.any(expert_mask > 0)))
             a_state = jax.lax.cond(actor_updated,
                                    lambda: _apply_gradients(a_state, a_grads, lr_actor),
                                    lambda: a_state)
@@ -557,7 +567,7 @@ class MAPPO:
             c_state = _apply_gradients(c_state, c_grads, lr_critic)
             return (a_state, c_state, actor_enabled), (
                 a_loss, c_loss, entropy, std, approx_kl, clip_fraction,
-                actor_updated.astype(jnp.float32), imitation)
+                actor_updated.astype(jnp.float32), imitation, bc)
 
         def ppo_loss(mean, log_std, z_f, act_f, old_log_prob, adv_f, mask):
             std = jnp.exp(log_std)
@@ -589,7 +599,7 @@ class MAPPO:
         # without threading a key through the training loop.
         keys = jax.random.split(
             jax.random.fold_in(jax.random.PRNGKey(0), actor_state.step), self.n_epochs)
-        (actor_state, critic_state, _), (a_losses, c_losses, entropies, stds, kls, clip_fractions, actor_updates, imitation_losses) = jax.lax.scan(
+        (actor_state, critic_state, _), (a_losses, c_losses, entropies, stds, kls, clip_fractions, actor_updates, imitation_losses, bc_losses) = jax.lax.scan(
             epoch, (actor_state, critic_state, jnp.bool_(True)), keys
         )
         metrics = {
@@ -603,15 +613,16 @@ class MAPPO:
             'clip_fraction': jnp.mean(clip_fractions),
             'actor_update_fraction': jnp.mean(actor_updates),
             'recovery_imitation_loss': jnp.mean(imitation_losses),
-            'teacher_fraction': jnp.mean(batch[-1]),
+            'teacher_fraction': jnp.mean(batch[11]),
+            'bc_loss': jnp.mean(bc_losses),
         }
         return actor_state, critic_state, metrics
 
     def update(self, actor_state, critic_state, traj, advantages, returns,
-               lr_actor, lr_critic):
+               lr_actor, lr_critic, bc_coef=0.0):
         return self._update_fn(
             actor_state, critic_state, traj, advantages, returns,
-            jnp.float32(lr_actor), jnp.float32(lr_critic),
+            jnp.float32(lr_actor), jnp.float32(lr_critic), jnp.float32(bc_coef),
         )
 
     # ------------------------------------------------------------------

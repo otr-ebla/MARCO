@@ -164,6 +164,11 @@ class MultiRobotCoverageEnv:
             raise ValueError('wall_cells must be a non-negative integer')
         self.sensing_radius  = float(cfg.get('sensing_radius',  5.0))
         self.robot_radius    = float(cfg.get('robot_radius',    0.20))
+        # A neighbouring cell counts as covered once the disk enters it by
+        # this fraction of the radius; the centre cell is always covered.
+        self.coverage_overlap = float(cfg.get('coverage_overlap', 0.3))
+        if not 0.0 <= self.coverage_overlap <= 1.0:
+            raise ValueError('coverage_overlap must be in [0, 1]')
         self.dt              = float(cfg.get('dt',              0.1))
         self.max_steps       = int(cfg.get('max_steps',       500))
         self.v_max           = float(cfg.get('v_max',           1.0))
@@ -471,6 +476,10 @@ class MultiRobotCoverageEnv:
         self._k_eff = min(self.k_teammates, max(self.num_robots - 1, 0))
         self._m_eff = min(self.m_humans, self.num_humans)
         self._robot_ids = jnp.arange(self.num_robots, dtype=jnp.int32)
+        span = int(np.ceil(self.robot_radius / self.cell_size))
+        offsets = np.arange(-span, span + 1, dtype=np.int32)
+        self._footprint_dc = jnp.asarray(np.tile(offsets, offsets.size))
+        self._footprint_dr = jnp.asarray(np.repeat(offsets, offsets.size))
 
     def _cell_centers(self) -> tuple[np.ndarray, np.ndarray]:
         xs = (np.arange(self.grid_w) + 0.5) * self.cell_size
@@ -552,6 +561,29 @@ class MultiRobotCoverageEnv:
         col = jnp.clip(jnp.floor(pos[:, 0] / self.cell_size), 0, self.grid_w - 1)
         row = jnp.clip(jnp.floor(pos[:, 1] / self.cell_size), 0, self.grid_h - 1)
         return col.astype(jnp.int32), row.astype(jnp.int32)
+
+    def _footprint_cells(self, pos: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Cells the robot disk covers: its centre cell, plus every other cell
+        it enters by at least `coverage_overlap` of its radius.
+
+        Returns (N, K) clipped cols and rows over the block around the centre
+        cell, whether the disk overlaps each one, and its squared distance
+        from the centre (0 for the centre cell).
+        """
+        col, row = self._pos_to_cell(pos)
+        cols = col[:, None] + self._footprint_dc[None, :]
+        rows = row[:, None] + self._footprint_dr[None, :]
+        x0 = cols.astype(jnp.float32) * self.cell_size
+        y0 = rows.astype(jnp.float32) * self.cell_size
+        dx = pos[:, 0:1] - jnp.clip(pos[:, 0:1], x0, x0 + self.cell_size)
+        dy = pos[:, 1:2] - jnp.clip(pos[:, 1:2], y0, y0 + self.cell_size)
+        d2 = dx * dx + dy * dy
+        inside = (cols >= 0) & (cols < self.grid_w) & (rows >= 0) & (rows < self.grid_h)
+        reach = (1.0 - self.coverage_overlap) * self.robot_radius
+        centre = (self._footprint_dc == 0) & (self._footprint_dr == 0)
+        touch = inside & ((d2 < reach ** 2) | centre[None, :])
+        return (jnp.clip(cols, 0, self.grid_w - 1), jnp.clip(rows, 0, self.grid_h - 1),
+                touch, d2)
 
     def _geodesic_distance(self, targets: jax.Array, free: jax.Array,
                            blocked: jax.Array | None = None) -> jax.Array:
@@ -697,7 +729,7 @@ class MultiRobotCoverageEnv:
     def _refresh_memory(self, state: EnvState, cover_mask: jax.Array) -> EnvState:
         """Scan, mark observed/covered cells, then exchange maps within comm range.
 
-        cover_mask : (N,) bool — robot i covered the cell it now stands on.
+        cover_mask : (N,) bool — robot i covered the coverable cells its disk overlaps.
         """
         n = self.num_robots
         ids = self._robot_ids
@@ -727,9 +759,12 @@ class MultiRobotCoverageEnv:
             valid.reshape(n, -1).astype(jnp.float32)
         )
 
-        own_c, own_r = self._pos_to_cell(pos)
-        covered = state.mem_covered.reshape(n, -1).at[ids, own_r * self.grid_w + own_c].max(
-            cover_mask.astype(jnp.float32)
+        foot_c, foot_r, touch, _ = self._footprint_cells(pos)
+        foot_flat = foot_r * self.grid_w + foot_c
+        foot_cover = (cover_mask[:, None] & touch
+                      & (self._free_flat[state.map_id, foot_flat] > 0.0))
+        covered = state.mem_covered.reshape(n, -1).at[ids[:, None], foot_flat].max(
+            foot_cover.astype(jnp.float32)
         )
 
         # Thin walls can lie between two coverable cell centres. Remember
@@ -921,7 +956,7 @@ class MultiRobotCoverageEnv:
         self, state: EnvState, joint_actions: jax.Array
     ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Physics, coverage and reward; the last output is the (N,) bool mask
-        of robots that covered their current cell, for `_refresh_memory`."""
+        of robots that covered their footprint cells, for `_refresh_memory`."""
         joint_actions, fallback_goal, fallback_used, control = self._recovery_actions(state, joint_actions)
         alive     = state.robot_alive
         v_cmds    = (joint_actions[:, 0] + 1.0) * 0.5 * self.v_max
@@ -1007,13 +1042,25 @@ class MultiRobotCoverageEnv:
         flat       = rows * self.grid_w + cols
         coverable  = self._free_flat[state.map_id, flat] > 0.0
         already    = prev_grid[rows, cols] > 0.0
-        eligible   = moved & coverable & ~already
-        
+
+        # A cell is covered as soon as any part of the robot disk overlaps it.
+        foot_c, foot_r, touch, foot_d2 = self._footprint_cells(new_pos)
+        foot_flat  = foot_r * self.grid_w + foot_c
+        foot_cover = (moved[:, None] & touch
+                      & (self._free_flat[state.map_id, foot_flat] > 0.0))
+        eligible   = foot_cover & (prev_grid[foot_r, foot_c] <= 0.0)
+
         ids   = self._robot_ids
-        claim = jnp.zeros((self.num_cells,), jnp.int32).at[flat].max(
-            jnp.where(eligible, ids + 1, 0)
+        claim = jnp.zeros((self.num_cells,), jnp.int32).at[foot_flat].max(
+            jnp.where(eligible, ids[:, None] + 1, 0)
         )
-        discovered = eligible & (claim[flat] == ids + 1)
+        new_cells  = eligible & (claim[foot_flat] == ids[:, None] + 1)
+        num_new    = jnp.sum(new_cells, axis=1).astype(jnp.float32)
+        discovered = num_new > 0.0
+        # The new cell nearest the centre represents this step's discovery in
+        # the lane/sweep bookkeeping, which works on single cells.
+        nearest = jnp.argmin(jnp.where(new_cells, foot_d2, jnp.inf), axis=1)
+        disc_cell = jnp.stack([foot_c[ids, nearest], foot_r[ids, nearest]], axis=-1)
         cell = jnp.stack([cols, rows], axis=-1)
         visit = moved & coverable & jnp.any(cell != state.last_visit, axis=-1)
         # Includes overlapping simultaneous claims, but never counts dwelling
@@ -1030,9 +1077,7 @@ class MultiRobotCoverageEnv:
             # losers do not pay a revisit penalty for a previously unseen cell.
             redundant_travel = (moved & entered & already & coverable).astype(jnp.float32)
 
-        new_grid = prev_grid.at[rows, cols].max(
-            jnp.where(moved & coverable, 1.0, 0.0)
-        )
+        new_grid = prev_grid.at[foot_r, foot_c].max(foot_cover.astype(jnp.float32))
 
         covered   = jnp.sum(new_grid[None, :, :] * self.room_masks[state.map_id], axis=(1, 2))
         ratio     = covered / jnp.maximum(self.room_totals[state.map_id], 1.0)
@@ -1071,13 +1116,13 @@ class MultiRobotCoverageEnv:
 
         if self.reward_mode in ('progress', 'sequential'):
             rewards = self._progress_reward(
-                state, new_pos, prev_grid, discovered, discovery_multiplier,
+                state, new_pos, prev_grid, num_new, disc_cell, discovery_multiplier,
                 wall_hit, robot_hit, robot_hit_human, complete,
             )
         else:
             rewards = jnp.where(
                 alive,
-                self.alpha * discovery_multiplier * discovered
+                self.alpha * discovery_multiplier * num_new
                 - self.beta * redundant_travel
                 - self.tau
                 - self.wall_kappa * wall_hit
@@ -1090,7 +1135,7 @@ class MultiRobotCoverageEnv:
             ).astype(jnp.float32)
 
         rewards -= self._axis_motion_cost(new_pos - state.robot_positions)
-        rewards += jnp.where(alive, self._sweep_reward(state, new_pos, discovered, visit, cell), 0.0)
+        rewards += jnp.where(alive, self._sweep_reward(state, disc_cell, discovered, visit, cell), 0.0)
 
         revisit_streak = jnp.where(discovered, 0, state.revisit_streak + revisited.astype(jnp.int32))
         no_progress_steps = jnp.where(discovered, 0, state.no_progress_steps + alive.astype(jnp.int32))
@@ -1108,7 +1153,7 @@ class MultiRobotCoverageEnv:
 
         step_count = state.step_count + 1
         sweep_run_length, lane_return = self._next_sweep_pattern(
-            state, new_pos, discovered, revisited)
+            state, disc_cell, discovered, revisited)
         truncated  = step_count >= self.max_steps
         terminated = complete | (jnp.any(collided) if self.terminate_on_collision else jnp.bool_(False))
 
@@ -1127,10 +1172,8 @@ class MultiRobotCoverageEnv:
             wall_hits        = wall_hit.astype(jnp.float32),
             robot_hits       = robot_hit.astype(jnp.float32),
             human_hits       = robot_hit_human.astype(jnp.float32),
-            last_discovery   = jnp.where(
-                discovered[:, None], jnp.stack([cols, rows], axis=-1), state.last_discovery
-            ),
-            sweep_direction  = self._next_sweep_direction(state, new_pos, discovered),
+            last_discovery   = jnp.where(discovered[:, None], disc_cell, state.last_discovery),
+            sweep_direction  = self._next_sweep_direction(state, disc_cell, discovered),
             sweep_run_length = sweep_run_length,
             lane_return      = lane_return,
             previous_visit   = jnp.where(visit[:, None], state.last_visit, state.previous_visit),
@@ -1156,8 +1199,8 @@ class MultiRobotCoverageEnv:
                       | (no_progress_steps >= self.fallback_stall_steps)))
         # Include this step's own coverage before planning; shared memory is
         # refreshed once by step/VecEnv after physics (including auto-reset).
-        planning = next_state.replace(mem_covered=state.mem_covered.at[ids, rows, cols].max(
-            (moved & coverable).astype(jnp.float32)))
+        planning = next_state.replace(mem_covered=state.mem_covered.at[ids[:, None], foot_r, foot_c].max(
+            foot_cover.astype(jnp.float32)))
         goals = self._recovery_goals(planning, request)
         activated = request & (goals >= 0)
         rewards -= self.fallback_cost * activated
@@ -1176,7 +1219,7 @@ class MultiRobotCoverageEnv:
             revisit_streak=jnp.where(reached, 0, revisit_streak),
             no_progress_steps=jnp.where(reached, 0, no_progress_steps),
         )
-        return next_state, rewards, terminated, truncated, moved & coverable
+        return next_state, rewards, terminated, truncated, moved
 
     def _recovery_goals(self, state, requested):
         if not self.fallback_enabled:
@@ -1271,33 +1314,32 @@ class MultiRobotCoverageEnv:
         output = jax.lax.map(control, self._robot_ids)
         return (*output[:3], dict(zip(fields, output[3:])))
 
-    def _discovery_direction(self, state, new_pos):
-        cols, rows = self._pos_to_cell(new_pos)
-        delta = jnp.stack([cols, rows], axis=-1) - state.last_discovery
+    def _discovery_direction(self, state, disc_cell):
+        delta = disc_cell - state.last_discovery
         adjacent = (jnp.all(state.last_discovery >= 0, axis=-1)
                     & (jnp.sum(jnp.abs(delta), axis=-1) == 1))
         return delta, adjacent
 
-    def _next_sweep_direction(self, state, new_pos, discovered):
-        delta, adjacent = self._discovery_direction(state, new_pos)
+    def _next_sweep_direction(self, state, disc_cell, discovered):
+        delta, adjacent = self._discovery_direction(state, disc_cell)
         direction = jnp.where(adjacent[:, None], delta, 0)
         return jnp.where(discovered[:, None], direction, state.sweep_direction)
 
-    def _sequential_discovery_reward(self, state, new_pos, discovered):
-        delta, adjacent = self._discovery_direction(state, new_pos)
+    def _sequential_discovery_reward(self, state, disc_cell, discovered):
+        delta, adjacent = self._discovery_direction(state, disc_cell)
         straight = jnp.all(delta == state.sweep_direction, axis=-1)
         reversal = (jnp.any(state.lane_return != 0, axis=-1)
                     & jnp.all(delta == state.lane_return, axis=-1))
         return discovered * adjacent * (self.sequential_bonus + self.straight_bonus * straight
                                          + self.boustrophedon_bonus * reversal)
 
-    def _next_sweep_pattern(self, state, new_pos, discovered, revisited):
+    def _next_sweep_pattern(self, state, disc_cell, discovered, revisited):
         """Recognise a straight run, a perpendicular cell, then reverse on the next lane.
 
         At least two straight new-cell edges must precede the lane shift. Any
         redundant entry breaks the pattern; turning in place does not.
         """
-        delta, adjacent = self._discovery_direction(state, new_pos)
+        delta, adjacent = self._discovery_direction(state, disc_cell)
         straight = jnp.all(delta == state.sweep_direction, axis=-1)
         run = jnp.where(adjacent, jnp.where(straight, state.sweep_run_length + 1, 1), 0)
         shift = (adjacent & (state.sweep_run_length >= 2)
@@ -1338,7 +1380,7 @@ class MultiRobotCoverageEnv:
         open_ahead = has_pref & inside & ~wall & ~edge_wall & ~covered
         return pref, has_pref, ahead, open_ahead
 
-    def _sweep_reward(self, state, new_pos, discovered, visit, cell):
+    def _sweep_reward(self, state, disc_cell, discovered, visit, cell):
         """Boustrophedon shaping on the cell grid, in every reward mode.
 
         straight  sweep_straight_bonus for a new cell straight ahead in the
@@ -1350,7 +1392,7 @@ class MultiRobotCoverageEnv:
                   cell while the cell ahead is still open work.
         """
         pref, has_pref, ahead, open_ahead = self._sweep_preference(state)
-        delta, adjacent = self._discovery_direction(state, new_pos)
+        delta, adjacent = self._discovery_direction(state, disc_cell)
         new_adjacent = discovered & adjacent & has_pref
         straight = new_adjacent & jnp.all(delta == pref, axis=-1)
         turn = (new_adjacent & ~open_ahead
@@ -1475,7 +1517,7 @@ class MultiRobotCoverageEnv:
 
     def _progress_reward(
         self, state: EnvState, new_pos: jax.Array, prev_grid: jax.Array,
-        discovered: jax.Array, discovery_multiplier: jax.Array,
+        num_new: jax.Array, disc_cell: jax.Array, discovery_multiplier: jax.Array,
         wall_hit: jax.Array, robot_hit: jax.Array, robot_hit_human: jax.Array,
         complete: jax.Array,
     ) -> jax.Array:
@@ -1501,6 +1543,7 @@ class MultiRobotCoverageEnv:
         the progress term telescopes for loops while that field remains unchanged.
         """
         alive = state.robot_alive
+        discovered = num_new > 0.0
         free = self.free_masks[state.map_id] > 0.5                       # (H, W)
         if self.use_memory:
             believed = state.mem_covered > 0.5                            # (N, H, W)
@@ -1531,7 +1574,7 @@ class MultiRobotCoverageEnv:
                       * (1.0 + self.completion_time_bonus * time_left))
 
         reward = (
-            self.alpha * discovery_multiplier * discovered
+            self.alpha * discovery_multiplier * num_new
             + self.progress_weight * progress
             + self._axis_motion_reward(new_pos - state.robot_positions, progress)
             - loiter
@@ -1543,7 +1586,7 @@ class MultiRobotCoverageEnv:
             + completion
         )
         if self.reward_mode == 'sequential':
-            reward += self._sequential_discovery_reward(state, new_pos, discovered)
+            reward += self._sequential_discovery_reward(state, disc_cell, discovered)
         return jnp.where(alive, reward, 0.0).astype(jnp.float32)
 
     def set_ghost_robot_prob(self, state: EnvState, prob: jax.Array) -> EnvState:

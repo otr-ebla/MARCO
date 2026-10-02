@@ -10,6 +10,7 @@ env:
   wall_cells: 1                # grid-aligned wall bands, at least one occupied cell
   sensing_radius: 5.0
   robot_radius: 0.20
+  coverage_overlap: 0.3
   dt: 0.1
   max_steps: 4000
   v_max: 1.0
@@ -65,6 +66,36 @@ train:
   n_epochs: 4          # limit repeated updates, especially with many minibatches
   num_minibatches: 8
   normalize_obs: true
+  # Behaviour cloning towards the BCD expert during RL, decaying linearly to 0.
+  # Set bc_coef (e.g. 0.5) when resuming from src.pretrain_bc; 0 disables it.
+  bc_coef: 0.0
+  bc_decay_updates: 300
+
+# src.pretrain_bc: DAgger behaviour cloning of the actor, then critic warm-up.
+pretrain:
+  num_envs: 32
+  bc_iterations: 300
+  rollout_steps: 128
+  beta_decay_iterations: 150  # expert executes with probability beta, 1 -> 0
+  replay_rollouts: 32         # aggregated DAgger data; ~37 MB per rollout (maps bit-packed)
+  grad_steps: 48              # actor steps per iteration
+  minibatch_size: 1024
+  lr: 3.0e-4
+  decision_weight: 2.0        # up-weight labels that change the previous command
+  decision_threshold: 0.2
+  eval_interval: 25
+  eval_envs: 16
+  critic_warmup_updates: 100
+  local_labels: true          # imitate only decisions whose target is inside the actor crop
+  rl_init_std: 0.3            # pre-tanh exploration std handed to RL (fresh actor: 1.0)
+  expert:
+    v_cruise: 0.8
+    k_omega: 2.0
+    heading_power: 3.0
+    stop_margin: 0.05
+    clearance_ramp: 0.4
+    lookahead: 0.3
+    yield_radius: 0.9
 
 wandb:
   enabled: true

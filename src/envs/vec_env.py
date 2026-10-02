@@ -89,10 +89,13 @@ class VecEnv:
 
     # ------------------------------------------------------------------
 
-    def _reset(self, key: jax.Array):
-        """Reset all environments. Returns (state, obs, global_states, infos)."""
+    def _reset(self, key: jax.Array, map_ids: jax.Array | None = None):
+        """Reset all environments, on random maps unless `map_ids` (E,) is given.
+
+        Returns (state, obs, global_states, infos).
+        """
         keys = jax.random.split(key, self.E)
-        state = jax.vmap(self.env.reset)(keys)
+        state = jax.vmap(self.env.reset)(keys, map_ids)
         obs = jax.vmap(self.env.get_obs)(state)
         gstate = jax.vmap(self.env.get_global_state)(state)
         infos = jax.vmap(self.env.get_info)(state)

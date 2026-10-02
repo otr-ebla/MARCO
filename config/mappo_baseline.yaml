@@ -12,6 +12,7 @@ env:
   cell_size: 0.5         # metres per grid cell → 24×16 = 384 cells for 12×8 m map
   sensing_radius: 5.0    # radius within which teammates / humans are visible
   robot_radius: 0.20     # metres, used for collision and spawn clearance
+  coverage_overlap: 0.3  # a neighbour cell is covered once the disk enters it by 30% of its radius
   dt: 0.1                # physics time step (seconds)
   # Horizon arithmetic: v_max × dt = 0.03 m per step against a 0.5 m cell, so a
   # robot needs ~17 steps to reach a new cell. 384 free cells / 3 robots = 128
