@@ -292,6 +292,43 @@ reward weights are saved in subsequent checkpoints; older checkpoints retain
 their saved weights when evaluated. An already running process must be restarted
 to use these code/config changes.
 
+#### Spatial-memory actor (IL + RL)
+
+`config/mappo_memory.yaml` gives the actor a two-level memory so it can return
+to uncovered areas it left behind:
+
+* **Spatial memory, read Neural-Map style** (`map_encoder: spatial_memory`).
+  The robot's personal map already stores, exactly and permanently, every cell
+  it knows and has covered (own lidar and coverage, OR-merged with teammates in
+  range). `SpatialMemoryRead` re-centres it on the robot's cell in a
+  `(2H-1) x (2W-1)` window, with derived *uncovered* (known free, not covered)
+  and *inside-floor* channels; cells beyond the floor read as known walls. A
+  strided CNN gives a global read (`map_embed`), and multi-head attention
+  (`attention_heads` x `attention_dim`) from the robot's current features over
+  every 2x2 block, keyed by its relative offset and distance, gives a context
+  read: where the relevant uncovered space is. The old two-layer map CNN read
+  absolute coordinates into 64 features.
+* **Temporal memory**: a 256-unit GRU (`--policy-mode end-to-end-memory`)
+  replaces the five-frame stack (`observation_stack: 1`) and keeps the
+  robot's current intention between steps.
+
+The BCD imitation phase supports the GRU: the replay keeps the rollout memory
+every `pretrain.sequence_length` (32) steps and clones the actor on ordered
+windows from that stored state, resetting it at episode ends (truncated BPTT).
+Train a new actor; old checkpoints keep their architecture:
+
+```bash
+python -m src.pretrain_bc --config config/mappo_memory.yaml \
+  --policy-mode end-to-end-memory --save-dir checkpoints/bc_memory
+python -m src.train_marl --config config/mappo_memory.yaml \
+  --policy-mode end-to-end-memory --resume checkpoints/bc_memory/checkpoint_bc.pkl \
+  --save-dir checkpoints/bc_memory_rl
+```
+
+The actor has about 1.1 M parameters (0.4 M for the sequential actor). The
+encoder settings are stored in the checkpoint, so `evaluate_policies` and
+`visualize_policy` rebuild the same network.
+
 #### Recurrent actor
 
 Select `--policy-mode end-to-end-memory` to add a GRU (width `model.hidden_size`,

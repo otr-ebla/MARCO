@@ -1,0 +1,149 @@
+# Memory actor: Neural-Map-style read of the personal map + GRU, cloned on sequences.
+#   python -m src.pretrain_bc --config config/mappo_memory.yaml \
+#       --policy-mode end-to-end-memory --save-dir checkpoints/bc_memory
+#   python -m src.train_marl  --config config/mappo_memory.yaml \
+#       --policy-mode end-to-end-memory --resume checkpoints/bc_memory/checkpoint_bc.pkl \
+#       --save-dir checkpoints/bc_memory_rl
+# Same environment, reward and expert as mappo_sequential.yaml; new actor shapes.
+env:
+  num_robots: 3
+  num_maps: 1
+  map_seed: 0
+  num_humans: 0
+  n_rays: 70
+  max_lidar_range: 5.0
+  cell_size: 0.5
+  wall_cells: 1                # grid-aligned wall bands, at least one occupied cell
+  sensing_radius: 5.0
+  robot_radius: 0.20
+  coverage_overlap: 0.8          # a neighbour cell is covered once the disk enters it by 80% of its radius
+  dt: 0.1
+  max_steps: 4000
+  v_max: 1.0
+  omega_max: 1.0
+  terminate_on_collision: false
+  obs_mode: memory_comm
+  history_cell: previous_visit # past cell only; the actor selects its own next destination
+  critic_context: true         # reward/control history is privileged critic input
+  fallback_enabled: true
+  fallback_revisit_threshold: 7  # consecutive covered-cell entries
+  fallback_stall_steps: 70       # no discovery, including stopping/spinning
+  fallback_linear_accel: 1.0     # m/s², local DWA velocity window
+  fallback_angular_accel: 2.0    # rad/s²
+  fallback_dwa_steps: 12         # prediction horizon in physics steps
+  fallback_dwa_stall_steps: 30   # switch to a velocity sequence after stalled DWA
+  fallback_sequence_steps: 64   # command buffer; replenished along the A* route
+  fallback_sequence_speed: 0.4  # m/s; each command is guarded by current lidar
+  comm_radius: 3.0
+  comm_slots: 2
+  local_coverage_size: 5
+  use_full_memory: true
+  observation_stack: 1         # the GRU carries short-term history instead of a frame stack
+  critic_stack: 5              # ordered global frames, with every robot's visit counts
+
+model:
+  hidden_size: 256             # trunk width and GRU state
+  # Personal map re-centred on the robot, read by a deep CNN (global) and
+  # multi-head attention over 2x2 blocks (context): see SpatialMemoryRead.
+  map_encoder: spatial_memory
+  map_embed: 256
+  attention_heads: 4
+  attention_dim: 16
+  lidar_embed: 64
+  critic_hidden: 256
+  critic_map_embed: 128
+  # Pre-tanh sigma floor ~0.10; action-space noise can still shrink at saturation.
+  log_std_min: -2.3
+  log_std_max: 1.0
+
+train:
+  # The GRU is trained by BPTT over each rollout_steps rollout.
+  num_envs: 32
+  rollout_steps: 128
+  total_updates: 2500
+  log_interval: 10
+  save_interval: 100
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_actor: 1.0e-4
+  lr_critic: 1.0e-3
+  lr_decay: true
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  recovery_imitation_coef: 0.5 # learn safe recovery commands with a separate supervised loss
+  target_kl: 0.02       # halt actor updates for this rollout when sampled KL exceeds this
+  max_grad_norm: 10.0
+  reward_scale: 0.05
+  huber_delta: 1.0
+  n_epochs: 4          # limit repeated updates, especially with many minibatches
+  num_minibatches: 8
+  normalize_obs: true
+  # Behaviour cloning towards the BCD expert during RL, decaying linearly to 0.
+  # Set bc_coef (e.g. 0.5) when resuming from src.pretrain_bc; 0 disables it.
+  bc_coef: 0.0
+  bc_decay_updates: 300
+
+# src.pretrain_bc: DAgger behaviour cloning of the actor, then critic warm-up.
+pretrain:
+  num_envs: 32
+  bc_iterations: 300
+  rollout_steps: 128
+  beta_decay_iterations: 150  # expert executes with probability beta, 1 -> 0
+  replay_rollouts: 32         # aggregated DAgger data; ~37 MB per rollout (maps bit-packed)
+  grad_steps: 48              # actor steps per iteration
+  minibatch_size: 1024
+  lr: 3.0e-4
+  decision_weight: 2.0        # up-weight labels that change the previous command
+  decision_threshold: 0.2
+  eval_interval: 25
+  eval_envs: 16
+  critic_warmup_updates: 100
+  local_labels: true          # imitate only decisions whose target is inside the actor crop
+  rl_init_std: 0.3            # pre-tanh exploration std handed to RL (fresh actor: 1.0)
+  sequence_length: 32         # GRU BPTT window; divides rollout_steps
+  expert:
+    v_cruise: 0.8
+    k_omega: 2.0
+    heading_power: 3.0
+    stop_margin: 0.05
+    clearance_ramp: 0.4
+    lookahead: 0.3
+    yield_radius: 0.9
+
+wandb:
+  enabled: true
+  project: mrcpp-mappo
+  mode: online
+
+e2e_num_maps: 64
+e2e_reward:
+  reward_mode: sequential
+  alpha: 10.0
+  coverage_reward_growth: 2.0
+  sequential_bonus: 6.0
+  straight_bonus: 4.0
+  boustrophedon_bonus: 8.0  # straight run -> adjacent lane -> reverse on new cells
+  revisit_cost: 6.0        # high initial cost per entry, multiplied by a capped streak
+  revisit_end_fraction: 0.025 # decays to 0.15 by completion or timeout
+  revisit_decay_power: 2.0    # phase = max(coverage fraction, elapsed episode fraction)
+  revisit_streak_cap: 3       # bound the cost of necessary transit
+  fallback_cost: 10.0      # once per successful recovery activation
+  axis_alignment_cost: 0.5 # (error / 45 degrees)^2, scaled by actual travel speed
+  progress_weight: 2.0
+  # Allow necessary turns; coverage and progress remain the main incentives.
+  loiter_cost: 0.2
+  # Teammate repulsion, per step and teammate: weight * max(0, 1 - d / radius).
+  # spread_* counts only comm-slot teammates (radius <= comm_radius);
+  # los_spread_* counts any teammate in line of sight within lidar range.
+  spread_weight: 2.0
+  spread_radius: 3.0
+  los_spread_weight: 1.5
+  los_spread_radius: 5.0
+  los_spread_decay_steps: 1500
+  los_spread_end_fraction: 0.3
+  tau: 0.02
+  wall_kappa: 2.0
+  kappa: 5.0
+  human_kappa: 10.0
+  completion_bonus: 200.0
+  completion_time_bonus: 1.0

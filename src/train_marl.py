@@ -442,6 +442,12 @@ def build_learner(vec_env: VecEnv, model_cfg: dict, train_cfg: dict, policy_mode
     actor_config = dict(lidar_embed=lidar_embed, hidden_size=hidden_size,
                         log_std_min=model_cfg.get('log_std_min', -5.0),
                         log_std_max=model_cfg.get('log_std_max', 1.0))
+    if model_cfg.get('map_encoder', 'cnn') != 'cnn':
+        # Stored in the checkpoint, so evaluators rebuild the same actor.
+        actor_config.update(map_encoder=model_cfg['map_encoder'],
+                            map_embed=int(model_cfg.get('map_embed', 256)),
+                            attention_heads=int(model_cfg.get('attention_heads', 4)),
+                            attention_dim=int(model_cfg.get('attention_dim', 16)))
     actor = Actor(
         recurrent=policy_mode == "end-to-end-memory",
         action_dim=vec_env.action_dim,

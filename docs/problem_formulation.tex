@@ -203,6 +203,16 @@ features of the five frames are concatenated with the vector and crop inputs
 and passed to an MLP (two layers of $128$ units). The output is the mean of a
 tanh-squashed Gaussian with a state-independent, bounded standard deviation.
 
+\item \textbf{Memory actor.}
+A stronger memory replaces the frame stack. \emph{Spatial memory}: the
+personal map, which never forgets an uncovered cell, is re-centred on the
+robot and read as in Neural Map: a strided CNN gives a global summary, and
+multi-head attention from the robot's current features over $2\times2$ blocks
+of the map, keyed by their relative offset and distance, retrieves where the
+relevant uncovered space lies. \emph{Temporal memory}: a 256-unit GRU keeps the
+robot's current intention between steps. Imitation is performed on ordered
+sequences with truncated backpropagation through time.
+
 \item \textbf{Centralized critic (privileged global state).}
 During training each robot has a value $V_i(s)$ computed from an
 agent-centred global state that actors cannot access. Each of the last $5$

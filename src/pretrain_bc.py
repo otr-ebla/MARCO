@@ -17,6 +17,12 @@ its own velocity, and without the weight it can fit most steps by repeating
 it. The environment's recovery fallback is off; the expert replaces it. The
 log std is not trained, so RL starts with its usual exploration noise.
 
+With `--policy-mode end-to-end-memory` the GRU actor is cloned on ordered
+sequences: the replay keeps each rollout's memory every `sequence_length`
+steps, and every gradient step replays windows of that length from their
+stored memory (truncated BPTT, memory reset at episode ends), so the GRU
+learns what to keep instead of seeing isolated states.
+
 Phase 2, critic warm-up. With the actor frozen, the RL setup (reward,
 fallback, discount, GAE) collects rollouts of the BC policy and only the
 critic is fitted, so PPO starts from V of the policy it updates rather than
@@ -41,7 +47,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from src.algorithms.mappo import compute_gae, rms_init, rms_normalize, rms_update
+from src.algorithms.mappo import (compute_gae, recurrent_actor_sequence, rms_init, rms_normalize,
+                                  rms_update)
 from src.envs.bcd_expert import BCDExpert, expert_steps, first_episode_summary
 from src.envs.vec_env import VecEnv
 from src.train_marl import (Rollout, build_env_config, build_learner, observation_config,
@@ -67,6 +74,7 @@ PRETRAIN_DEFAULTS = {
     'critic_warmup_updates': 100,
     'local_labels': True,          # imitate only decisions whose target lies inside the actor crop
     'rl_init_std': 0.3,            # pre-tanh exploration std handed to RL (actor init: 1.0)
+    'sequence_length': 32,         # recurrent actor: BPTT window, must divide rollout_steps
     'expert': {},
 }
 
@@ -93,6 +101,23 @@ class BCCarry(NamedTuple):
     obs: jax.Array
     rms: object
     chunk: jax.Array
+    memory: object = None   # (E*N, H) GRU state, recurrent actor only
+
+
+def actor_step(actor, params, obs: jax.Array, memory):
+    """Mean action for a flat (B, D) batch; returns (mean, next memory or None)."""
+    if actor.recurrent:
+        mean, _, memory = actor.apply(params, obs, memory)
+        return mean, memory
+    mean, _ = actor.apply(params, obs)
+    return mean, None
+
+
+def reset_memory(memory, done: jax.Array, n: int):
+    """Zero the GRU state of every robot in an environment that just ended."""
+    if memory is None:
+        return None
+    return jnp.where(jnp.repeat(done, n)[:, None], 0., memory)
 
 
 def make_collect(actor, vec_env: VecEnv, expert: BCDExpert, num_steps: int, decision_weight: float,
@@ -109,9 +134,10 @@ def make_collect(actor, vec_env: VecEnv, expert: BCDExpert, num_steps: int, deci
     expert_local = jax.vmap(expert.local)
 
     def step(params, beta, carry: BCCarry, key):
-        state, obs, rms, chunk = carry
+        state, obs, rms, chunk, memory = carry
         rms = rms_update(rms, obs.reshape(e * n, -1))
-        mean, _ = actor.apply(params, rms_normalize(rms, obs).reshape(e * n, -1))
+        mean, next_memory = actor_step(actor, params, rms_normalize(rms, obs).reshape(e * n, -1),
+                                       memory)
         policy = jnp.tanh(mean).reshape(e, n, -1)
         label, chunk, filtered = expert_act(state, chunk)
         local = expert_local(state, chunk)
@@ -133,7 +159,9 @@ def make_collect(actor, vec_env: VecEnv, expert: BCDExpert, num_steps: int, deci
             filtered=filtered.astype(jnp.float32), expert_used=use_expert.astype(jnp.float32),
             local=local.astype(jnp.float32),
         )
-        return BCCarry(state, obs_next, rms, chunk), data
+        if memory is not None:
+            data['memory'] = memory    # state before this step, for sequence replay
+        return BCCarry(state, obs_next, rms, chunk, reset_memory(next_memory, done, n)), data
 
     @jax.jit
     def collect(params, carry, beta, key):
@@ -145,18 +173,18 @@ def make_evaluate(actor, vec_env: VecEnv, num_steps: int):
     """Jitted closed-loop run of the deterministic actor, statistics only."""
     e, n = vec_env.E, vec_env.num_robots
 
-    def step(params, rms, state_obs, _):
-        state, obs = state_obs
-        mean, _ = actor.apply(params, rms_normalize(rms, obs).reshape(e * n, -1))
+    def step(params, rms, carry, _):
+        state, obs, memory = carry
+        mean, memory = actor_step(actor, params, rms_normalize(rms, obs).reshape(e * n, -1), memory)
         state, obs, _, _, done, info, _ = vec_env.step(state, jnp.tanh(mean).reshape(e, n, -1))
-        return (state, obs), dict(coverage=info['coverage_ratio'], done=done,
+        return (state, obs, reset_memory(memory, done, n)), dict(coverage=info['coverage_ratio'], done=done,
                                   complete=info['complete'], wall=info['wall_collision_rate'],
                                   robot=info['robot_collision_rate'],
                                   filtered=jnp.zeros((e,), jnp.float32))
 
     @jax.jit
-    def run(params, rms, state_obs):
-        return jax.lax.scan(partial(step, params, rms), state_obs, None, length=num_steps)
+    def run(params, rms, carry):
+        return jax.lax.scan(partial(step, params, rms), carry, None, length=num_steps)
     return run
 
 
@@ -186,12 +214,20 @@ class ReplayBuffer:
     Observations are split at `split`: the continuous prefix stays float32
     and the binary tail (crops and personal maps) is bit-packed, about 14x
     smaller at the default observation, so many more rollouts fit.
+
+    Sample i of slot s is step t, env e, robot r with
+    i = s * per_slot + (t * E + e) * N + r, so ordered sequences can be read
+    back. With a 'memory' template the GRU state is kept every
+    `sequence_length` steps, and 'done' per sample for the memory resets.
     """
 
-    def __init__(self, slots: int, template: dict, split: int, binary_tail: bool):
+    def __init__(self, slots: int, template: dict, split: int, binary_tail: bool,
+                 sequence_length: int = 0):
         self.slots = slots
         self.split = split
-        self.per_slot = int(np.prod(template['label'].shape[:-1]))
+        self.shape = template['label'].shape[:-1]                # (T, E, N)
+        self.per_slot = int(np.prod(self.shape))
+        self.sequence_length = sequence_length
         obs_dim = template['obs'].shape[-1]
         self.tail = obs_dim - split if binary_tail else 0
         size = slots * self.per_slot
@@ -201,19 +237,34 @@ class ReplayBuffer:
             **{k: jnp.zeros((size, *template[k].shape[3:]), template[k].dtype)
                for k in ('label', 'weight', 'change')},
         }
+        self.keys = ('obs', 'label', 'weight', 'change')
+        if 'memory' in template:
+            t, e, n = self.shape
+            if not sequence_length or t % sequence_length:
+                raise ValueError('sequence_length must divide rollout_steps')
+            hidden = template['memory'].shape[-1]
+            self.data['done'] = jnp.zeros((size,), jnp.float32)
+            self.data['memory'] = jnp.zeros((slots, t // sequence_length, e * n, hidden), jnp.float32)
+            self.keys += ('done', 'memory')
         self.next = 0
         self.filled = 0
         head_dim = obs_dim - self.tail
 
         @partial(jax.jit, donate_argnums=(0,))
-        def insert(data, rollout, start):
+        def insert(data, rollout, start, slot):
             obs = rollout['obs'].reshape(-1, obs_dim)
             packed = {'head': obs[:, :head_dim],
                       'bits': jnp.packbits(obs[:, head_dim:] > .5, axis=-1),
                       **{k: rollout[k].reshape(-1, *data[k].shape[1:])
                          for k in ('label', 'weight', 'change')}}
-            return {k: jax.lax.dynamic_update_slice_in_dim(data[k], packed[k], start, axis=0)
-                    for k in data}
+            if 'memory' in data:
+                packed['done'] = jnp.broadcast_to(rollout['done'][..., None], self.shape).reshape(-1)
+            data = {**data, **{k: jax.lax.dynamic_update_slice_in_dim(data[k], v, start, axis=0)
+                               for k, v in packed.items()}}
+            if 'memory' in data:
+                data['memory'] = data['memory'].at[slot].set(
+                    rollout['memory'][::self.sequence_length])
+            return data
         self._insert = insert
 
     def observations(self, data: dict, idx: jax.Array) -> jax.Array:
@@ -224,17 +275,61 @@ class ReplayBuffer:
         return jnp.concatenate([data['head'][idx], bits.astype(jnp.float32)], axis=-1)
 
     def add(self, rollout: dict) -> None:
-        self.data = self._insert(self.data, {k: rollout[k] for k in ('obs', 'label', 'weight', 'change')},
-                                 self.next * self.per_slot)
+        self.data = self._insert(self.data, {k: rollout[k] for k in self.keys},
+                                 self.next * self.per_slot, self.next)
         self.next = (self.next + 1) % self.slots
         self.filled = min(self.filled + 1, self.slots)
 
 
-def make_regress(actor, tx, grad_steps: int, batch: int, decision_threshold: float, unpack):
-    """Jitted actor regression on replay samples; `unpack(data, idx)` gives observations."""
+def sample_windows(data: dict, count, key, shape: tuple, length: int, num_seq: int, unpack):
+    """Random ordered windows from a ReplayBuffer's data, for the recurrent actor.
+
+    Each window is `length` consecutive steps of one rollout slot (< count)
+    and one environment, all N robots, starting at a stored-memory boundary.
+    Returns obs (L, S, N, D), label (L, S, N, 2), weight and change (L, S, N),
+    done (L, S) and the GRU state at the window start (S*N, H).
+    """
+    t_steps, e_envs, n = shape
+    k_slot, k_window, k_env = jax.random.split(key, 3)
+    slot = jax.random.randint(k_slot, (num_seq,), 0, count)
+    window = jax.random.randint(k_window, (num_seq,), 0, t_steps // length)
+    env = jax.random.randint(k_env, (num_seq,), 0, e_envs)
+    t = window[None, :] * length + jnp.arange(length)[:, None]                     # (L, S)
+    idx = ((slot * t_steps * e_envs * n)[None, :, None]
+           + ((t * e_envs + env[None, :]) * n)[..., None]
+           + jnp.arange(n)[None, None, :])                                          # (L, S, N)
+    flat = idx.reshape(-1)
+    obs = unpack(data, flat).reshape(*idx.shape, -1)
+    memory = data['memory'][slot[:, None], window[:, None],
+                            env[:, None] * n + jnp.arange(n)[None, :]]               # (S, N, H)
+    return (obs, *(data[k][flat].reshape(*idx.shape, *data[k].shape[1:])
+                   for k in ('label', 'weight', 'change')),
+            data['done'][idx[..., 0]], memory.reshape(num_seq * n, -1))
+
+
+def make_regress(actor, tx, grad_steps: int, batch: int, decision_threshold: float, unpack,
+                 buffer_shape: tuple = (), sequence_length: int = 0):
+    """Jitted actor regression on replay samples; `unpack(data, idx)` gives observations.
+
+    Feed-forward: `count` is the number of filled samples, drawn independently.
+    Recurrent: `count` is the number of filled rollouts; each step replays
+    windows of `sequence_length` ordered steps (all robots of an environment)
+    from the GRU state stored at the window start.
+    """
+    if actor.recurrent:
+        num_seq = max(batch // (sequence_length * buffer_shape[2]), 1)
 
     def losses(params, rms, obs, label, weight, change):
         mean, _ = actor.apply(params, rms_normalize(rms, obs))
+        return mean_losses(mean, label, weight, change)
+
+    def sequence_losses(params, rms, obs, label, weight, change, done, memory):
+        """obs (L, S, N, D), done (L, S), memory (S*N, H): one window per S."""
+        _, (mean, _) = recurrent_actor_sequence(actor, params, rms_normalize(rms, obs), memory, done)
+        return mean_losses(mean, *(x.reshape(mean.shape[0], *x.shape[3:])
+                                   for x in (label, weight, change)))
+
+    def mean_losses(mean, label, weight, change):
         error = jnp.mean((jnp.tanh(mean) - label) ** 2, axis=-1)
         loss = jnp.sum(error * weight) / jnp.maximum(jnp.sum(weight), 1e-6)
         valid = (weight > 0).astype(jnp.float32)
@@ -247,9 +342,15 @@ def make_regress(actor, tx, grad_steps: int, batch: int, decision_threshold: flo
     def regress(params, opt_state, data, count, rms, key):
         def body(carry, k):
             params, opt_state = carry
-            idx = jax.random.randint(k, (batch,), 0, count)
-            args = (unpack(data, idx), data['label'][idx], data['weight'][idx], data['change'][idx])
-            (loss, (decision, steady)), grads = jax.value_and_grad(losses, has_aux=True)(
+            if actor.recurrent:
+                loss_fn = sequence_losses
+                args = sample_windows(data, count, k, buffer_shape, sequence_length, num_seq, unpack)
+            else:
+                idx = jax.random.randint(k, (batch,), 0, count)
+                loss_fn = losses
+                args = (unpack(data, idx), data['label'][idx], data['weight'][idx],
+                        data['change'][idx])
+            (loss, (decision, steady)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 params, rms, *args)
             updates, opt_state = tx.update(grads, opt_state, params)
             return (optax.apply_updates(params, updates), opt_state), (loss, decision, steady)
@@ -260,6 +361,11 @@ def make_regress(actor, tx, grad_steps: int, batch: int, decision_threshold: flo
     @jax.jit
     def fresh_loss(params, rollout, rms, key):
         """Loss on a sample of a rollout the actor has not been trained on yet."""
+        if actor.recurrent:
+            loss, (decision, steady) = sequence_losses(
+                params, rms, *(rollout[k] for k in ('obs', 'label', 'weight', 'change', 'done')),
+                rollout['memory'][0])
+            return loss, decision, steady
         flat = {k: rollout[k].reshape(-1, *rollout[k].shape[3:])
                 for k in ('obs', 'label', 'weight', 'change')}
         idx = jax.random.randint(key, (2048,), 0, flat['label'].shape[0])
@@ -286,7 +392,9 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
              num_envs: int | None = None, num_maps: int | None = None,
              bc_iterations: int | None = None, critic_updates: int | None = None,
              expert_only: bool = False, wandb_overrides: dict | None = None,
-             algo: str = 'mappo') -> None:
+             algo: str = 'mappo', policy_mode: str = 'end-to-end') -> None:
+    if policy_mode not in ('end-to-end', 'end-to-end-memory'):
+        raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
     pcfg = {**PRETRAIN_DEFAULTS, **config.get('pretrain', {})}
     unknown = set(pcfg) - set(PRETRAIN_DEFAULTS)
@@ -339,7 +447,6 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
             (state, expert.init_chunks((env.num_maps,))), env.max_steps, chunk_steps))
         return
 
-    policy_mode = 'end-to-end'
     model_cfg = config.get('model', {})
     train_cfg = dict(config.get('train', {}))
     train_cfg['num_envs'] = E
@@ -361,19 +468,30 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
     evaluate = make_evaluate(actor, eval_env, chunk_steps)
     evaluate_rl = make_evaluate(actor, rl_eval_env, chunk_steps)
 
+    def initial_memory(envs):
+        return (jnp.zeros((envs * env.num_robots, actor.hidden_size), jnp.float32)
+                if actor.recurrent else None)
+
     state, obs, _, _ = vec_env.reset(reset_key)
-    carry = BCCarry(state, obs, rms_init(vec_env.norm_dim), expert.init_chunks((E,)))
+    carry = BCCarry(state, obs, rms_init(vec_env.norm_dim), expert.init_chunks((E,)),
+                    initial_memory(E))
     # The observation tail after the normalised prefix holds 0/1 maps unless the
     # crop summary ring (means) is enabled.
     template = {'obs': jax.ShapeDtypeStruct((T, E, env.num_robots, env.obs_dim), jnp.float32),
                 'label': jax.ShapeDtypeStruct((T, E, env.num_robots, 2), jnp.float32),
                 'weight': jax.ShapeDtypeStruct((T, E, env.num_robots), jnp.float32),
                 'change': jax.ShapeDtypeStruct((T, E, env.num_robots), jnp.float32)}
+    sequence_length = int(pcfg['sequence_length']) if actor.recurrent else 0
+    if actor.recurrent:
+        template['memory'] = jax.ShapeDtypeStruct((T, E * env.num_robots, actor.hidden_size),
+                                                  jnp.float32)
     buffer = ReplayBuffer(int(pcfg['replay_rollouts']), template, vec_env.norm_dim,
-                          binary_tail=not env.crop_summary)
+                          binary_tail=not env.crop_summary, sequence_length=sequence_length)
     regress, fresh_loss = make_regress(actor, tx, int(pcfg['grad_steps']),
                                        int(pcfg['minibatch_size']), float(pcfg['decision_threshold']),
-                                       buffer.observations)
+                                       buffer.observations, (T, E, env.num_robots), sequence_length)
+    if actor.recurrent:
+        print(f"Recurrent actor: BPTT windows of {sequence_length} steps from stored GRU state")
     print(f"Replay: {buffer.slots} rollouts, {buffer.slots * buffer.per_slot} samples, "
           f"{sum(v.nbytes for v in buffer.data.values()) / 2**30:.2f} GiB")
 
@@ -411,7 +529,8 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
         fresh = fresh_loss(params, data, rms, k_fresh) if it > 1 else (jnp.nan,) * 3
         buffer.add(data)
         params, opt_state, (loss, decision, steady) = regress(
-            params, opt_state, buffer.data, buffer.filled * buffer.per_slot, rms, k_train)
+            params, opt_state, buffer.data,
+            buffer.filled if actor.recurrent else buffer.filled * buffer.per_slot, rms, k_train)
 
         episodes, ep_cov, ep_done = rollout_episodes(data)
         row = dict(phase='bc', iteration=it, beta=beta, loss=float(loss),
@@ -425,11 +544,13 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
             print(f"Iteration {it} closed-loop evaluation (beta=0):")
             state, eval_obs = eval_reset()
             summarise('actor', run_first_episodes(lambda c: evaluate(params, rms, c),
-                                                  (state, eval_obs), env.max_steps, chunk_steps))
+                                                  (state, eval_obs, initial_memory(eval_env.E)),
+                                                  env.max_steps, chunk_steps))
             # As RL will run it: recovery fallback as configured. Selects the best actor.
             state, eval_obs = eval_reset(rl_eval_env)
             s = summarise('actor+rl', run_first_episodes(lambda c: evaluate_rl(params, rms, c),
-                                                         (state, eval_obs), env.max_steps, chunk_steps))
+                                                         (state, eval_obs, initial_memory(rl_eval_env.E)),
+                                                         env.max_steps, chunk_steps))
             row.update(eval_coverage=s['coverage'], eval_completion=s['complete'],
                        eval_contacts=s['contacts'])
             score = (s['complete'], s['coverage'], -s['contacts'])
@@ -501,7 +622,7 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
     save_checkpoint(path, 0, actor_state, critic_state, rms, tail_dim, policy_mode,
                     reward_weights, obs_config, algo, actor_config)
     print(f"\nSaved {path}. Resume RL with:\n  python -m src.train_marl --config {config_path} "
-          f"--resume {path} --save-dir <dir>")
+          f"--policy-mode {policy_mode} --resume {path} --save-dir <dir>")
     if run is not None:
         run.finish()
 
@@ -519,6 +640,8 @@ if __name__ == '__main__':
     parser.add_argument('--bc-iterations', type=int, default=None)
     parser.add_argument('--critic-updates', type=int, default=None)
     parser.add_argument('--algo', choices=['mappo', 'ippo'], default='mappo')
+    parser.add_argument('--policy-mode', choices=['end-to-end', 'end-to-end-memory'],
+                        default='end-to-end', help='end-to-end-memory clones a GRU actor on sequences')
     parser.add_argument('--expert-only', action='store_true',
                         help='Only evaluate the expert on every map and exit')
     parser.add_argument('--wandb', dest='wandb_enabled', action='store_true', default=None)
@@ -529,4 +652,4 @@ if __name__ == '__main__':
     pretrain(args.config, args.save_dir, None if args.backend == 'auto' else args.backend,
              args.envs, args.maps, args.bc_iterations, args.critic_updates, args.expert_only,
              {'enabled': args.wandb_enabled, 'name': args.wandb_name, 'group': args.wandb_group},
-             args.algo)
+             args.algo, args.policy_mode)
