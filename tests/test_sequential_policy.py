@@ -216,7 +216,7 @@ class SweepRewardTests(unittest.TestCase):
     def test_simultaneous_team_visits_count_overlap(self):
         env = MultiRobotCoverageEnv(CONFIG)
         state = env.reset(jax.random.PRNGKey(5)).replace(robot_positions=jnp.array(
-            [[1.05, 1.05], [1.45, 1.45], [4.25, 4.25]]))
+            [[1.02, 1.02], [1.48, 1.48], [4.25, 4.25]]))
         state, _, _, _ = jax.jit(env.step)(state, jnp.array([[-1., 0.]] * 3))
         info = env.get_info(state)
         self.assertEqual(float(info['cell_entries']), 3.)
@@ -225,10 +225,10 @@ class SweepRewardTests(unittest.TestCase):
         self.assertEqual(float(info['covered_cells']), 8.)
         self.assertEqual(float(info['recoverage']), 3. / 8.)
 
-    def test_neighbour_needs_thirty_percent_of_radius(self):
+    def test_neighbour_needs_eighty_percent_of_radius(self):
         env = MultiRobotCoverageEnv(CONFIG)
-        reach = 0.7 * env.robot_radius
-        # Robot 0 enters cell (col 3, row 2) by just under 30% of its radius,
+        reach = 0.2 * env.robot_radius
+        # Robot 0 enters cell (col 3, row 2) by just under 80% of its radius,
         # robot 2 enters (col 3, row 6) by just over it.
         state = env.reset(jax.random.PRNGKey(5)).replace(robot_positions=jnp.array(
             [[1.5 - reach - 0.01, 1.25], [4.25, 4.25], [1.5 - reach + 0.01, 3.25]]))
