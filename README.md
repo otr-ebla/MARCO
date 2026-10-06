@@ -21,7 +21,7 @@ Each robot operates under strict **decentralized execution**, relying exclusivel
 
 ### Environment & Dynamics
 * **Unknown Floor Plans:** Episodes take place in randomly generated 2D indoor layouts unknown to the robots at initialization.
-* **Dynamic Obstacles:** Simulated using the **Headed Social Force Model (HSFM)**, producing realistic, reactive pedestrian trajectories (goal attraction, inter-agent and wall repulsion) rather than scripted paths.
+* **Dynamic Obstacles:** Optional pedestrians walk straight segments in random directions (0.5–5 m, a new heading on reaching a wall) and stop instead of stepping towards a nearby robot. A *ghost robot* curriculum makes them ignore robots early in training and react more as the policy improves; at evaluation they always react.
 
 ### Centralized Training, Decentralized Execution (CTDE)
 During training, the central critic leverages privileged global state (full robot states, pedestrian trajectories, and the complete environment coverage grid) to provide accurate credit assignment without requiring global observations at test time.
@@ -439,9 +439,10 @@ its policy-gradient loss and entropy bonus;
 the critic still learns from all transitions and recovery costs propagate to
 preceding policy actions through GAE.
 
-Known cells, covered cells, and observed blocked edges merge by logical OR when
-robots are strictly less than `comm_radius` (default 3 m) apart. Memory uses dense
-JAX bitmaps with the same cell-key union semantics as a sparse dictionary;
+Each robot's memory is one int8 grid of cell states (unknown, occupied, free,
+covered). Robots strictly less than `comm_radius` (default 3 m) apart merge their
+memories cell by cell, keeping the most informative state (no line of sight is
+required);
 exchange is simultaneous and single-hop per physics step. Recovery maintains
 this memory even for legacy actor observations. Controller settings and reward
 weights are saved in new training checkpoints and restored by evaluation and

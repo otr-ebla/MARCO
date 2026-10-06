@@ -12,7 +12,7 @@
 \setlength{\emergencystretch}{3em}
 \newcommand{\R}{\mathbb{R}}
 
-\title{Multi-Robot Coverage Path Planning in Unknown Indoor Environments with MARL\\[0.3em]
+\title{Multi-Robot Exploratory Coverage Path Planning in Unknown Indoor Dynamic Environments with MARL\\[0.3em]
 \large Problem Formulation}
 \author{}
 \date{}
@@ -22,57 +22,64 @@
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=0.7\linewidth]{robot_coverage_vector.pdf}
-    \caption{2D floor of the MR-CPP task. Robots, equipped with 2D LiDAR
+    \includegraphics[width=0.6\linewidth]{images/robot_coverage_vector.pdf}
+    \caption{2D floor of the MR-ECPP task. Robots, equipped with 2D LiDAR
     sensors, are drawn as coloured discs; pedestrians as grey ellipses.}
     \label{fig:floor}
 \end{figure}
 
-\noindent We consider a cooperative \textbf{Multi-Robot Coverage Path Planning
-(MR-CPP)} problem: a team of robots must physically cover every reachable cell
-of an initially unknown indoor floor (\emph{exploratory coverage}) while
-avoiding walls, other robots and, optionally, pedestrians. Each robot keeps its
-own persistent map belief and merges it with teammates when they are within
-communication range, an approach inspired by \cite{xiao2020a_distributed}.
-Velocity commands are produced by a policy trained with Multi-Agent
-Reinforcement Learning (MAPPO) under centralized training with decentralized
-execution (CTDE). The policy is first initialized by Imitation Learning (IL)
-from a Boustrophedon Cellular Decomposition (BCD) expert, and a classical
-A*{}+DWA fallback takes over when the learned behaviour stops making progress,
-inspired by \cite{carvalho2025deep}.
+\noindent We consider a cooperative \textbf{Multi-Robot Exploratory Coverage
+Path Planning (MR-ECPP)} problem. A team of robots must physically pass over
+every reachable part of an indoor floor that none of them knows in advance,
+while avoiding walls, each other and, optionally, pedestrians. The robots
+therefore have to \emph{explore} the floor and \emph{cover} it at the same
+time.
 
-\medskip
-\noindent\textbf{Fixed requirements.} Individual map beliefs, intermittent
-map exchange, perfect odometry, random initial positions, 2D LiDAR sensing,
-continuous actions, MARL with CTDE, emergent (implicit) coordination and a
-fallback controller. \textbf{Modelling choices.} Physical floor coverage, known
-initial poses and homogeneous differential-drive robots.
+The approach rests on four ideas:
+\begin{itemize}
+ \item \textbf{Local knowledge only.} Each robot builds its own map of what
+       it has seen and covered, and merges it with nearby teammates when they
+       are in communication range, an approach inspired by
+       \cite{xiao2020a_distributed}. No robot ever has the true map.
+ \item \textbf{A learned policy.} Each robot is driven by a neural network
+       that outputs velocity commands directly. It is trained with
+       Multi-Agent Reinforcement Learning (MAPPO) under centralized training
+       with decentralized execution (CTDE).
+ \item \textbf{A good starting point.} Before reinforcement learning, the
+       policy can be initialized by Imitation Learning (IL) from a classical
+       Boustrophedon Cellular Decomposition (BCD) expert.
+ \item \textbf{A safety net.} A classical A*{}+DWA controller takes over when
+       the learned behaviour stops making progress, inspired by
+       \cite{carvalho2025deep}.
+\end{itemize}
+The problem is formulated by the following items.
 
 %==========================================================================
-\section{Environment and robots}
+\section*{Environment and robots}
 
 \begin{enumerate}[label=\textbf{\arabic*.}]
 
-\item \textbf{Workspace and layout distribution.}
-The floor is a bounded $12\times 8$~m rectangle subdivided by recursive space
-partitioning into rooms, corridors and doorways (Fig.~\ref{fig:floor}).
-Interior walls are grid-aligned and occupy a full cell band. Every episode
-samples a layout from a bank of 64 procedurally generated maps, to favour
-generalization; held-out map seeds are used for evaluation. The floor
-dimensions are fixed, but the layout is unknown to the robots.
+\item \textbf{Workspace and layouts.}
+The floor is a $12\times 8$~m rectangle divided into rooms, corridors and
+doorways (Fig.~\ref{fig:floor}). Interior walls are aligned with the grid and
+are at least one cell thick. At every episode the floor plan is drawn from a
+bank of $64$ procedurally generated layouts, so the policy learns a general
+strategy instead of memorizing one floor. The size of the floor is fixed, but
+its layout is unknown to the robots.
 
 \item \textbf{Continuous motion, discrete coverage.}
-Robots move in continuous space, while mapping and coverage use a common
-square grid with resolution $\delta=0.5$~m ($24\times16$ cells). A free cell
-is \emph{covered} as soon as the robot disc overlaps it (a neighbouring cell
-counts once the disc enters it by $0.8\,r$). Coverage is permanent within an
-episode. The episode ends when all reachable free cells are covered or after
+Robots move in continuous space, while maps and coverage use a square grid
+of cell size $0.5$~m ($24\times16$ cells). When a robot moves, the cell under
+its centre becomes \emph{covered}, together with each neighbouring cell that
+the robot body enters by at least $80\%$ of its radius. This threshold avoids
+counting cells that the robot only grazes. Coverage is permanent within an
+episode. The episode ends when all reachable free cells are covered, or after
 $T_{\max}=4000$ steps ($400$~s).
 
 \item \textbf{Robot team.}
 The team is $\mathcal I=\{1,\dots,N\}$ with $N=3$. Robots are homogeneous:
-identical sensing, motion limits and capabilities. Initial positions are
-sampled at random among collision-free free cells.
+they have the same sensors, motion limits and capabilities. They start at
+random collision-free positions.
 
 \item \textbf{Kinematics.}
 Each robot is a disc of radius $r=0.2$~m with pose $q_i=(x_i,y_i,\theta_i)$
@@ -82,65 +89,83 @@ and differential-drive (unicycle) kinematics
  \dot y_i=v_i\sin\theta_i,\qquad
  \dot\theta_i=\omega_i,
 \]
-integrated with step $\Delta t=0.1$~s.
+integrated with a time step $\Delta t=0.1$~s, which is also the decision
+period of the policy.
 
-\item \textbf{Continuous action space.}
-At each step the policy outputs $a_i\in(-1,1)^2$ (tanh-squashed Gaussian),
+\item \textbf{Continuous actions.}
+At each step the policy outputs $a_i\in(-1,1)^2$ (a tanh-squashed Gaussian),
 mapped to
 \[
  v_i\in[0,v_{\max}],\quad \omega_i\in[-\omega_{\max},\omega_{\max}],
  \qquad v_{\max}=1~\text{m/s},\ \omega_{\max}=1~\text{rad/s}.
 \]
-MARL approaches to MR-CPP with continuous actions are currently a gap in the
-literature.
+The robot drives forward only and steers by turning. MARL approaches to
+MR-ECPP with continuous actions are currently a gap in the literature.
 
 \item \textbf{Collisions.}
-Collisions are \emph{soft}: a move into a wall, a robot or a pedestrian is
-rejected, the robot is penalized, and the episode continues.
+Collisions are \emph{soft}. A move that would hit a wall, a robot or a
+pedestrian is rejected: the robot stays where it is for that step and
+receives a penalty, but it keeps operating and the episode continues. This
+lets the policy learn from its mistakes without ending the episode.
 
 \item \textbf{Pedestrians (optional).}
-Pedestrians walk at $0.5$~m/s along straight segments of random heading and
-length, and stop when a robot is too close. They are disabled in the current
-IL+RL configuration and enabled for robustness experiments.
+Pedestrians walk along straight segments in random directions and stop
+instead of stepping towards a nearby robot. During training a
+\emph{ghost robot} curriculum is used: at first pedestrians ignore the robots,
+so the robots must learn to avoid them on their own; as the policy improves,
+pedestrians increasingly react. At test time they always react. The main
+experiments use no pedestrians.
 
-\item \textbf{Perfect sensing and common frame.}
-Each robot knows its initial global pose and integrates perfect odometry, so
-its trajectory is known in a common global frame without drift. Each robot
-carries a 2D LiDAR with $70$ rays over $360^\circ$ and $5$~m range, used both
-to discover the floor and to sense obstacles and other agents.
+\item \textbf{Sensing and localization.}
+Each robot knows its initial pose in a common global frame and has
+\emph{perfect odometry}, so it always knows where it is, without drift.
+Each robot carries a 2D LiDAR with $L=70$ rays over $360^\circ$ and
+$r_L=5$~m range. The LiDAR detects walls, other robots and pedestrians, and
+is used both to discover the floor and to avoid obstacles.
 
 \end{enumerate}
 
 %==========================================================================
-\section{Map memory and communication}
+\section*{Map memory and communication}
 
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
 \item \textbf{Individual map belief.}
-Robot $i$ keeps a persistent map $M_i$ that is initially empty and grows as
-LiDAR rays discover new cells or teammates share theirs. Each cell is in one
-of the states
+\label{item:individual_map_belief}
+Each robot $i$ keeps its own map $M_i$, a grid of the same size as the
+floor that starts empty and is filled during the episode. The map tells the
+robot what it knows: where the walls are, which areas it has already
+covered, and which areas still need to be covered. This is what lets the
+robot decide where to go without access to the true map.
+
+Every cell of $M_i$ is in one of four states:
 \[
  \textit{unknown},\quad
- \textit{known--occupied},\quad
- \textit{known--free--uncovered},\quad
- \textit{known--free--covered}.
+ \textit{occupied},\quad
+ \textit{free--uncovered},\quad
+ \textit{free--covered}.
 \]
-A cell becomes \emph{known} when a LiDAR ray crosses it (or hits it, for
-walls), but it becomes \emph{covered} only when the robot body passes over it:
-discovering a cell is not covering it. Wall edges hit by LiDAR are also stored
-as blocked graph edges. The memory is implemented as per-robot bitmaps
-(\textit{known}, \textit{covered}, \textit{blocked edges}) with the same
-union semantics as a sparse dictionary of cell keys.
+The map is updated in three ways:
+\begin{itemize}
+ \item \textit{Sensing}: cells seen by the LiDAR become known, either as
+       free--uncovered or as occupied (walls);
+ \item \textit{Covering}: a free cell becomes covered only when the robot
+       body passes over it, so seeing a cell is not the same as covering it;
+ \item \textit{Sharing}: robots in communication range exchange their maps,
+       so each one also learns what its teammates have seen and covered.
+\end{itemize}
+Information is only ever added: once a cell is known it stays known, and
+once it is covered it stays covered.
 
 \item \textbf{Communication.}
 Two robots communicate when their distance is below
-$R_{\mathrm{comm}}=3$~m. Connected robots merge their maps by logical OR
-(known cells, covered cells and blocked edges), so after an exchange they
-share the same belief. Exchange is simultaneous and single-hop at every step;
-multi-hop propagation happens over successive steps. When disconnected, robots
-keep sensing, mapping and acting independently, so redundant coverage is
-possible.
+$R_{\mathrm{comm}}=3$~m. Connected robots share their positions and merge
+their maps cell by cell, keeping the most informative state of each cell,
+so after an exchange they share the same belief. Exchange happens at every
+step and only between direct neighbours; information still spreads through
+the team over successive steps, from robot to robot. When disconnected,
+robots keep sensing, mapping and acting on their own. They may then cover
+the same area twice, which is the price of not relying on communication.
 
 \end{enumerate}
 
@@ -150,40 +175,166 @@ possible.
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
 \item \textbf{Observation frame.}
-At each step robot $i$ builds, only from its own sensing and its own map:
+At each step robot $i$ builds its observation only from its own sensing and
+its own map. One frame holds:
 \begin{itemize}
- \item \textbf{Pose}: $(x/W,\ y/H,\ \cos\theta,\ \sin\theta)$.
+ \item \textbf{Pose}: $(x/W,\ y/H,\ \cos\theta,\ \sin\theta)$, where $W$ and
+       $H$ are the floor dimensions.
  \item \textbf{Last executed command}: $(v/v_{\max},\ \omega/\omega_{\max})$.
- \item \textbf{Robot id}.
- \item \textbf{Teammates in communication range}: up to $2$ slots
-       $(\mathrm{id}_j,\ \Delta x_j,\ \Delta y_j)$, zero when empty.
- \item \textbf{History}: validity flag and relative position of the
-       previously visited cell, and the current sweep direction.
- \item \textbf{LiDAR}: $70$ normalized ranges.
- \item \textbf{Local map crop} (from \cite{hasan2025efficient}): a $5\times5$
-       grid-aligned window centred on the robot, with three Boolean channels
-       \textit{occupied}, \textit{covered}, \textit{known}. Cells beyond the
-       floor boundary are marked as occupied and known.
- \item \textbf{Full personal map}: the whole $24\times16$ belief with five
-       channels (\textit{occupied}, \textit{covered}, \textit{known},
-       \textit{self position}, \textit{teammates in range}). Unknown
-       geometry and out-of-range teammates are not exposed.
+ \item \textbf{Robot id}: $i\in\{1,\dots,N\}$.
+ \item \textbf{Teammates in communication range}: the $2$ nearest teammates
+       within $R_{\mathrm{comm}}$, each as $(\mathrm{id}_j,\ \Delta x_j,\
+       \Delta y_j)$, their relative position in metres. An empty slot is all
+       zeros, and $\mathrm{id}=0$ marks it as empty.
+ \item \textbf{History}: a validity flag and the relative position of the
+       centre of the previously visited cell, followed by the current sweep
+       direction $d\in\{-1,0,1\}^2$, the direction of the robot's last step
+       between two adjacent new cells. They tell the robot where it comes
+       from and which way it is sweeping.
+ \item \textbf{LiDAR}: $L=70$ ranges, normalized by $r_L=5$~m.
+ \item \textbf{Local crop} (extending \cite{hasan2025efficient}): a
+       $3\times7\times7$ window of the robot's map
+       (item~\ref{item:individual_map_belief}) around the robot. It works
+       like a small camera looking down on the robot. Its inner $5\times5$
+       core is centred on the robot's cell and has three binary channels:
+       \begin{itemize}
+        \item \textit{obstacle}: a wall cell the robot knows about;
+        \item \textit{covered}: a cell covered according to the robot's map;
+        \item \textit{robots}: a cell where a teammate in communication range
+              stands.
+       \end{itemize}
+       Cells beyond the floor boundary are marked as obstacles. The one-cell
+       ring around the core summarizes the rest of the floor: each side of
+       the ring holds, for each channel, the average over all the cells
+       beyond that side, i.e.\ the fraction of known walls, of covered cells
+       and of cells with a teammate. A side with no cell inside the floor
+       takes the beyond-the-floor values (obstacle $1$, covered $0$, robots
+       $0$), and the corners are $0$. The core gives detail where the robot
+       is; the ring tells it, coarsely, in which direction work is left.
 \end{itemize}
-No target cell, waypoint or route is given: the actor must choose where to go
-from its memory and history.
 
-\item \textbf{Distant information.}
-In the IL+RL configuration distant knowledge is provided by the full personal
-map, encoded by a CNN. The alternative \emph{distant summary} of
-\cite{carvalho2025deep}, a one-cell ring that extends the crop to $7\times7$
-and stores, in each direction, the average status of all cells beyond the
-crop plus an extent channel, is also implemented and used in the baseline
-configuration.
+\begin{figure}[t]
+    \centering
+    \makebox[\textwidth][c]{%
+        \includegraphics[width=1.1\textwidth]{images/NN_architecture.pdf}%
+    }
+    \caption{Actor policy architecture.}
+    \label{fig:nn_architecture}
+\end{figure}
 
-\item \textbf{Observation stacking.}
-The last $5$ frames (current one included, $0.4$~s of history) are stacked in
-time order and encoded with shared weights; missing frames at episode start are
-zero-filled. A GRU actor is available as an alternative form of memory.
+A frame therefore has $18$ scalar entries, $70$ LiDAR ranges and a
+$3\times7\times7$ crop. The full map is \emph{not} an actor input: it stays
+inside the robot and reaches the policy only through the crop. No target
+cell, waypoint or route is given: the actor must decide where to go from the
+crop, its history and the ring.
+
+\item \textbf{Short-term memory.}
+A single frame does not show how the robot is moving. Two variants give the
+actor a short-term memory:
+\begin{itemize}
+ \item \textbf{Observation stacking} (main variant): the last $N_s=5$
+       frames, $0.5$~s of history, are given to the actor in time order.
+ \item \textbf{GRU memory} (alternative): the actor reads one frame per step
+       and a recurrent GRU unit (Fig.~\ref{fig:nn_architecture}) carries the
+       history in its internal state.
+\end{itemize}
+
+\item \textbf{Actor network.}
+The LiDAR scan is read by a circular 1D convolutional network, so the two
+ends of the scan stay adjacent, and the crop by a small 2D convolutional
+network. Their features are joined with the scalar entries and passed to
+fully connected layers that output the mean of the action distribution. Its
+spread does not depend on the observation and is bounded, so exploration
+never collapses or explodes.
+
+\item \textbf{Parameter sharing.}
+All robots use the same actor, with the same weights. The robots are
+identical and the floors are unknown, so no robot should specialize in a
+particular role or area. Sharing also means that the experience of every
+robot trains the same policy, so the policy learns $N$ times faster than with
+separate networks.
+
+\end{enumerate}
+
+%==========================================================================
+\section{Global state for the critic}
+
+\begin{enumerate}[label=\textbf{\arabic*.},resume]
+
+\item \textbf{A privileged view.}
+The critic is used only during training, so it may read information that no
+robot has: the true floor plan, the true team coverage and the exact state of
+the whole team. A single critic network $V_\phi$, shared by all robots, is
+evaluated once per robot on an \emph{agent-specific} global state
+$s_t^i = f_i(s_t)$: the same global state $s_t$, seen from the point of view
+of robot $i$ \cite{yu2022surprising}. Own cell, own motion and own task
+context are marked separately from the rest of the team, so the critic gives
+a different value to each robot, consistent with the per-robot rewards.
+
+\item \textbf{Structure of the state.}
+The input of the critic for robot $i$ is a short history of \emph{global
+frames}:
+\[
+  s_t^i = \big(g_{t-K+1}^i,\ \dots,\ g_t^i\big),
+  \qquad
+  g_t^i = \big(\mathbf{M}_t^i,\ \mathbf{z}_t^i\big),
+  \qquad K=5.
+\]
+Each frame has two parts: a stack of maps $\mathbf{M}_t^i$ for everything
+that has a position on the floor, and a vector $\mathbf{z}_t^i$ for
+everything that does not. Stacking frames lets the critic see trends, such
+as a robot that keeps going back and forth, much as the actor does with its
+own frames. At the start of an episode the missing frames are left empty.
+
+\item \textbf{Global maps $\mathbf{M}_t^i$.}
+Grids over the whole floor that tell the critic how much work is left, where
+it is, and who is where:
+\begin{itemize}
+ \item \textbf{Walls}: the true floor plan, including unexplored parts, so
+       the critic knows how large the task really is.
+ \item \textbf{Coverage}: the cells the team has actually covered. Together
+       with the walls, it shows the remaining work.
+ \item \textbf{Self}: the cell of robot $i$, which places it relative to the
+       remaining work.
+ \item \textbf{Teammates}: the cells of all other robots, wherever they are.
+       Unlike the actor, the critic is not limited by communication range.
+ \item \textbf{Visit counts}: one map per robot, recording how often it has
+       entered each cell. They distinguish efficient coverage from robots
+       going over the same cells again, and show which robot is doing it.
+\end{itemize}
+
+\item \textbf{Global vector $\mathbf{z}_t^i$.}
+Information that is not spatial or is hard to read from a grid:
+\begin{itemize}
+ \item \textbf{Own motion}: pose and velocity of robot $i$, placed first so
+       the critic knows which robot it is evaluating.
+ \item \textbf{Team motion}: pose and velocity of all robots, and positions of
+       the pedestrians.
+ \item \textbf{Task context of robot $i$}: the internal quantities that
+       shape its rewards and decide whether the recovery controller takes
+       over: elapsed episode time, revisit streak and steps without progress,
+       recovery state and goal, current sweep and lane state, and the current
+       weight of the revisit penalty. None of these appears in the maps, yet
+       each one changes the future return.
+ \item \textbf{Previously visited cell} of every robot, which adds a sense of
+       direction to the team's motion.
+\end{itemize}
+
+\item \textbf{Critic network.}
+A small convolutional network reads the stacked maps and summarizes the
+spatial situation. The summary is joined with the global vector, and fully
+connected layers turn both into the value $V_\phi(s_t^i)$: an estimate of
+the return robot $i$ can still expect from time $t$ on
+(Fig.~\ref{fig:critic_network}). The critic is only a training signal: once
+training is over it is discarded, and each robot acts using only its own
+observation.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{images/critic_network.pdf}
+    \caption{Centralized critic architecture.}
+    \label{fig:critic_network}
+\end{figure}
 
 \end{enumerate}
 
@@ -192,48 +343,76 @@ zero-filled. A GRU actor is available as an alternative form of memory.
 
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
-\item \textbf{Decision model.}
-The task is a cooperative Dec-POMDP. Each actor acts on its own observation
-history; parameters are shared among the homogeneous robots, while runtime
-memory is not.
+\item \textbf{Multi-agent problem.}
+The robots learn coverage by trial and error with multi-agent reinforcement
+learning (MARL). The task is a cooperative partially observable Markov game
+$\langle \mathcal{N}, \mathcal{S}, \{\mathcal{A}^i\}, P, \{r^i\},
+\{\Omega^i\}, \gamma \rangle$: a Dec-POMDP in which each robot receives its
+own reward $r^i_t$. Two difficulties arise: \emph{partial observability},
+because each robot sees only its own observation $o^i_t$, and
+\emph{non-stationarity}, because all robots learn at the same time, so from
+the point of view of one robot the environment keeps changing.
 
-\item \textbf{Actor network.}
-LiDAR is encoded by a circular 1D CNN, the personal map by a 2D CNN, and the
-features of the five frames are concatenated with the vector and crop inputs
-and passed to an MLP (two layers of $128$ units). The output is the mean of a
-tanh-squashed Gaussian with a state-independent, bounded standard deviation.
+\item \textbf{CTDE.}
+At execution each robot runs its own copy of the \emph{actor}
+$\pi_\theta(a^i_t\mid o^i_t)$ and decides only from its own observation,
+with no central computer. During training in simulation, the \emph{critic}
+$V_\phi$ reads the privileged global state and judges the robots' actions.
+Since it sees the whole team, changes in the teammates' behaviour appear in
+its input instead of looking like noise.
 
-\item \textbf{Memory actor.}
-A stronger memory replaces the frame stack. \emph{Spatial memory}: the
-personal map, which never forgets an uncovered cell, is re-centred on the
-robot and read as in Neural Map: a strided CNN gives a global summary, and
-multi-head attention from the robot's current features over $2\times2$ blocks
-of the map, keyed by their relative offset and distance, retrieves where the
-relevant uncovered space lies. \emph{Temporal memory}: a 256-unit GRU keeps the
-robot's current intention between steps. Imitation is performed on ordered
-sequences with truncated backpropagation through time.
+\item \textbf{PPO.}
+Comparing the critic's value with what actually happened gives the
+advantage $\hat{A}^i_t$, computed with GAE: positive if an action turned out
+better than expected, negative if worse. The actor is updated with
+PPO~\cite{schulman2017proximal}:
+\[
+  L(\theta) = \mathbb{E}\Big[\min\big(\rho^i_t\,\hat{A}^i_t,\
+  \operatorname{clip}(\rho^i_t,\,1-\epsilon,\,1+\epsilon)\,\hat{A}^i_t\big)\Big],
+  \qquad
+  \rho^i_t = \frac{\pi_\theta(a^i_t\mid o^i_t)}{\pi_{\theta_{\text{old}}}(a^i_t\mid o^i_t)} .
+\]
+Good actions become more likely and bad ones less likely, while clipping the
+ratio $\rho^i_t$ limits how far a single update can move the policy. An
+entropy bonus keeps the robots exploring.
 
-\item \textbf{Centralized critic (privileged global state).}
-During training each robot has a value $V_i(s)$ computed from an
-agent-centred global state that actors cannot access. Each of the last $5$
-frames contains:
+\item \textbf{MAPPO.}
+MAPPO~\cite{yu2022surprising} brings PPO to CTDE. All robots share one actor
+and one centralized critic, which is evaluated once per robot. Each robot's
+advantage is computed only from its own rewards and values. This keeps
+credit assignment clear: the robot that covered new cells is credited, and
+an idle teammate is not.
+
+\item \textbf{Training.}
+Training alternates between collecting experience, with $32$ parallel
+environments for $128$ steps each on randomly drawn layouts, and updating
+actor and critic on it. Four mechanisms keep learning stable:
 \begin{itemize}
- \item \textbf{Grid channels}: walls, true team coverage, own position,
-       teammates' positions, and a visit-count map for every robot.
- \item \textbf{Vector}: pose and velocity of all robots (and pedestrian
-       positions, when present), previous visited cell of every robot, and a
-       task context (episode time, revisit streak, stall counter, fallback
-       state and goal, sweep direction and lane state, current revisit weight).
+ \item the actor stops updating when the policy changes too much, measured
+       by the KL divergence between old and new policy;
+ \item the critic uses a Huber loss, which is precise on small errors and
+       robust to large ones, so rare large rewards do not disrupt it;
+ \item rewards are scaled and observations normalized;
+ \item steps driven by the recovery controller are excluded from PPO, since
+       the actor did not choose them, and are imitated instead with a
+       separate supervised loss.
 \end{itemize}
-The critic is a 2D CNN followed by an MLP (two layers of $256$ units).
+The hyperparameters are listed in Table~\ref{tab:ppo_hparams}.
 
-\item \textbf{PPO setup.}
-Generalized advantage estimation ($\gamma=0.99$, $\lambda=0.95$), clipping
-$0.2$, entropy coefficient $0.01$, early stop of actor epochs at KL $0.02$,
-Huber value loss, running observation normalization and reward scaling
-$0.05$. Learning rates are $10^{-4}$ (actor) and $10^{-3}$ (critic) with
-linear decay; $32$ environments $\times$ $128$ steps per update, $4$ epochs
-and $8$ minibatches.
+\begin{table}[h]
+\centering
+\begin{tabular}{ll}
+\toprule
+$\gamma$ / GAE $\lambda$ & $0.99$ / $0.95$ \\
+Clipping $\epsilon$ / entropy coefficient & $0.2$ / $0.01$ \\
+Learning rate actor / critic & $10^{-4}$ / $10^{-3}$, linear decay \\
+Epochs / minibatches & $4$ / $8$ \\
+KL threshold / reward scale & $0.02$ / $0.05$ \\
+\bottomrule
+\end{tabular}
+\caption{PPO hyperparameters.}
+\label{tab:ppo_hparams}
+\end{table}
 
 \end{enumerate}
 
@@ -242,130 +421,291 @@ and $8$ minibatches.
 
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
-\item \textbf{Per-robot reward.}
-Every term uses only the robot's own knowledge, except coverage and completion,
-which use the true team coverage. With $C\in[0,1]$ the team coverage
-fraction:
+\item \textbf{Structure.}
+Each robot $i$ receives its own reward $r_t^i$ at every step. It is the sum
+of terms, each encouraging or discouraging one specific behaviour:
+\[
+  r_t^i =
+  \underbrace{r^{\mathrm{cov}} + r^{\mathrm{done}}}_{\text{task}}
+  + \underbrace{r^{\mathrm{seq}} + r^{\mathrm{lane}} + r^{\mathrm{axis}}}_{\text{sweep pattern}}
+  + \underbrace{r^{\mathrm{prog}} + r^{\mathrm{loit}} + r^{\mathrm{rev}}}_{\text{efficiency}}
+  + \underbrace{r^{\mathrm{spr}}}_{\text{coordination}}
+  + \underbrace{r^{\mathrm{col}} + r^{\mathrm{fb}} - \tau}_{\text{safety, time}} .
+\]
+The reward is computed by the simulator and used only during training, so it
+may use the true coverage. Terms that say where a robot \emph{should} go
+(progress and lane shaping) use only the robot's own map, so the actor is
+never asked to react to information it cannot see. Below, $C_t\in[0,1]$ is
+the fraction of the floor covered by the team, $T_{\max}$ the episode length,
+and $\mathbb{1}[P]$ the indicator function, equal to $1$ if condition $P$
+holds and $0$ otherwise. The robot index $i$ is dropped when clear from
+context. Parameter values are listed in Table~\ref{tab:reward_params}.
 
-\begin{center}
-\begin{tabular}{p{0.32\linewidth}p{0.6\linewidth}}
+%--------------------------------------------------------------------------
+\item \textbf{Task terms.}
+\begin{itemize}
+ \item \textbf{New coverage.}
+ \[
+   r^{\mathrm{cov}}_t = \alpha\,(1 + g\,C_{t-1})\; n_t ,
+ \]
+ where $n_t$ is the number of cells newly covered by the robot at this step.
+ When two robots reach the same new cell at the same time, only one of them
+ is credited. This is the only term that directly measures the objective.
+ The factor $(1+g\,C_{t-1})$ makes late cells worth up to three times more
+ than early ones: late cells are usually the hardest to reach, such as
+ isolated corners or cells left behind, and without this factor the
+ incentive to finish would fade exactly when it is needed most.
+
+ \item \textbf{Completion.}
+ \[
+   r^{\mathrm{done}}_t = B\,\Big(1 + \beta\,\big(1 - \tfrac{t}{T_{\max}}\big)\Big)\,
+   \mathbb{1}[\text{floor fully covered at } t],
+ \]
+ given to \emph{every} robot when the last cell is covered. The shared bonus
+ makes the team succeed or fail together, so a robot has a reason to help
+ finish an area it did not start. The time factor makes an early finish worth
+ up to twice as much as a late one, rewarding speed and not only success.
+\end{itemize}
+
+%--------------------------------------------------------------------------
+\item \textbf{Sweep-pattern terms.}
+Coverage alone does not care \emph{how} the floor is covered. These terms
+favour the Boustrophedon pattern of a lawn mower: long straight lanes joined
+by one-cell shifts with a reversal of direction, which covers a region
+without gaps and with few re-entries.
+
+Both terms look at the sequence of \emph{new} cells a robot covers. Let
+$c_{\text{last}}$ be the last new cell the robot covered and $\delta_t$ the
+step from $c_{\text{last}}$ to the new cell covered now. The new cell is
+\emph{adjacent} if $\|\delta_t\|_1 = 1$, i.e.\ it touches $c_{\text{last}}$
+on one of its four sides. The step $\delta_t$ is compared with two reference
+directions:
+\begin{itemize}
+  \item $d$, the previous step: $\delta_t = d$ means the robot keeps going
+        straight;
+  \item $\ell$, the return direction: after a straight run of at least two
+        cells along a lane, a one-cell sideways shift sets $\ell$ to the
+        opposite of that lane's direction. $\delta_t = \ell$ means the robot
+        goes back along the new lane, completing the U-turn. When there was
+        no shift, $\ell$ is not defined and this case never occurs.
+\end{itemize}
+
+\begin{itemize}
+ \item \textbf{Sequential coverage: how the robot moves.}
+ \[
+   r^{\mathrm{seq}}_t = \mathbb{1}[\|\delta_t\|_1 = 1]\,
+   \big(b_{\mathrm{seq}} + b_{\mathrm{str}}\,\mathbb{1}[\delta_t = d]
+         + b_{\mathrm{bou}}\,\mathbb{1}[\delta_t = \ell]\big).
+ \]
+ An adjacent new cell earns $b_{\mathrm{seq}}$; going straight earns
+ $b_{\mathrm{str}}$ more; the U-turn on the new lane earns $b_{\mathrm{bou}}$
+ more. A new cell that is not adjacent earns nothing. This term rewards
+ covering in connected strips instead of jumping from place to place, but it
+ only looks at the shape of the move: it cannot tell whether turning was a
+ good idea.
+
+ \item \textbf{Lane shaping: when the robot should turn.}
+ Let $p$ be the direction the robot is expected to follow: $\ell$ right
+ after a lane shift, $d$ otherwise. The cell \emph{ahead} is
+ $c_{\text{last}} + p$. It is \emph{open} if, according to the robot's own
+ map, it is neither a wall nor already covered. Then
+ \begin{align*}
+    r^{\mathrm{lane}}_t ={} & b_{\mathrm{ls}}\,\mathbb{1}[\text{new cell straight ahead}] \\
+    & {}+ b_{\mathrm{lt}}\,\mathbb{1}[\text{new cell sideways},\ \text{ahead not open}] \\
+    & {}- c_{\mathrm{lb}}\,\mathbb{1}[\text{robot leaves the lane},\ \text{ahead open}].
+ \end{align*}
+ In words: keep going straight while the lane still has work; turn sideways
+ only when the lane is finished or blocked; leaving a lane that is still open
+ is penalized, because the robot would have to come back later for the
+ leftover piece.
+\end{itemize}
+The two terms complement each other. If a robot turns sideways onto a new
+cell while the cell ahead is still open, $r^{\mathrm{seq}}_t$ rewards the
+move (the cell is adjacent) but $r^{\mathrm{lane}}_t$ penalizes it (the lane
+was not finished). If the cell ahead were a wall, both would reward the turn.
+Sequential coverage teaches \emph{how} to move; lane shaping teaches
+\emph{when} to change lane.
+
+\begin{itemize}
+ \item \textbf{Axis alignment.}
+ \[
+   r^{\mathrm{axis}}_t = -\,c_{\mathrm{ax}}
+   \Big(\frac{e_t}{45^\circ}\Big)^{2}
+   \min\!\Big(1,\ \frac{\|\Delta \mathbf{x}_t\|}{v_{\max}\Delta t}\Big),
+ \]
+ where $e_t\in[0^\circ,45^\circ]$ is the angle between the robot's
+ displacement $\Delta\mathbf{x}_t$ and the nearest grid axis. Lanes follow
+ rows and columns of cells, and diagonal motion crosses cells only partially,
+ leaving slivers uncovered. Squaring the error barely penalizes small
+ drifts, and the speed factor means that turning on the spot costs nothing.
+\end{itemize}
+
+%--------------------------------------------------------------------------
+\item \textbf{Efficiency terms.}
+\begin{itemize}
+ \item \textbf{Progress towards work.}
+ Let $D^i(\mathbf{x})$ be the distance, in cells, from position $\mathbf{x}$
+ to the nearest cell that robot $i$ \emph{believes} is free and uncovered,
+ measured along routes through cells it knows to be free. When no such cell
+ is reachable, the nearest exploration frontier (a known free cell next to
+ unknown space) is used instead. Then
+ \[
+   r^{\mathrm{prog}}_t = \lambda_p\,\big(D^i(\mathbf{x}_{t-1}) - D^i(\mathbf{x}_t)\big).
+ \]
+ Once the robot's surroundings are finished, the coverage reward is zero and
+ gives no direction. This term fills that gap by pulling the robot towards
+ the nearest remaining work. It follows the idea of potential-based shaping
+ \cite{ng1999policy}: as long as the map does not change, it sums to zero
+ over any closed loop, so it cannot be farmed by driving back and forth.
+
+ \item \textbf{Loitering.}
+ \[
+   r^{\mathrm{loit}}_t = -\,c_{l}\;\mathbb{1}[n_t = 0]\;
+   \Big(1 - \mathrm{clip}\big(\tfrac{\Delta D_t}{\Delta D_{\max}},0,1\big)\Big),
+ \]
+ where $\Delta D_t$ is the progress of the step and $\Delta D_{\max}$ the
+ progress of a full-speed step straight towards work. A step that neither
+ covers a new cell nor approaches work is wasted, so parking, spinning or
+ wandering over covered cells is charged. Driving at full speed towards work
+ costs nothing.
+
+ \item \textbf{Re-coverage.}
+ \begin{align*}
+    r^{\mathrm{rev}}_t &= -\,w(\phi_t)\,\min(k_t,\,k_{\max})\;\mathbb{1}[\text{entered a covered cell}], \\[0.5em]
+    w(\phi) &= c_{\mathrm{rv}}\big[\eta + (1-\eta)(1-\phi)^2\big],
+    \qquad
+    \phi_t = \max\!\big(C_t,\ t/T_{\max}\big),
+ \end{align*}
+ where $k_t$ counts the consecutive entries into covered cells since the
+ robot last covered a new one. Crossing covered cells is the main source of
+ inefficiency, and the growing streak punishes long detours more than a
+ single unavoidable crossing. The weight $w(\phi)$ is high early on, when
+ fresh work is nearby, and decays towards $\eta\,c_{\mathrm{rv}}$ as coverage
+ or time advances, because near the end the remaining cells are scattered
+ and reaching them \emph{requires} crossing covered ones.
+\end{itemize}
+
+%--------------------------------------------------------------------------
+\item \textbf{Coordination term.}
+\[
+  r^{\mathrm{spr}}_t =
+  -\,w_s \!\!\sum_{j\in\mathcal{N}_i^{\mathrm{comm}}}\!\! \Big[1 - \frac{d_{ij}}{r_s}\Big]_+
+  \;-\; w_{\mathrm{los}}(t) \!\!\sum_{j\in\mathcal{N}_i^{\mathrm{los}}}\!\! \Big[1 - \frac{d_{ij}}{r_{\mathrm{los}}}\Big]_+ ,
+  \qquad
+  w_{\mathrm{los}}(t) = w_{\mathrm{los}}\Big[1-(1-\eta_{\mathrm{los}})\min\!\big(1,\tfrac{t}{T_d}\big)\Big],
+\]
+where $d_{ij}$ is the distance between robots $i$ and $j$,
+$[\cdot]_+=\max(0,\cdot)$, $\mathcal{N}_i^{\mathrm{comm}}$ the teammates in
+the robot's communication slots and $\mathcal{N}_i^{\mathrm{los}}$ the
+teammates in direct line of sight. Robots close to each other compete for
+the same cells, so the team covers fewer cells per step than it could. The
+two repulsions push the team to spread out: the first acts on teammates
+known through communication, the second on any teammate the robot can see,
+and is strongest at the start of the episode, when the robots must leave the
+same area. No room assignment or negotiation is involved: coordination
+emerges from these terms and from the shared completion bonus.
+
+%--------------------------------------------------------------------------
+\item \textbf{Safety and time terms.}
+\begin{itemize}
+ \item \textbf{Collisions}:
+ $r^{\mathrm{col}}_t = -\kappa_w\,\mathbb{1}[\text{wall}] - \kappa_r\,\mathbb{1}[\text{robot}]
+ - \kappa_h\,\mathbb{1}[\text{pedestrian}]$. The penalty grows with the
+ severity of the contact, so hitting a person is the worst case.
+ \item \textbf{Recovery activation}:
+ $r^{\mathrm{fb}}_t = -c_{\mathrm{fb}}\,\mathbb{1}[\text{recovery controller activated}]$,
+ charged once, to the action that triggered it. Without this cost the
+ policy could rely on the recovery controller instead of learning to get out
+ of trouble by itself.
+ \item \textbf{Time}: a constant $-\tau$ per step, a small, steady pressure to
+ finish quickly.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Reward parameters.}
+\label{tab:reward_params}
+\begin{tabular}{llll}
 \toprule
-\textbf{Term} & \textbf{Value} \\
+\textbf{Symbol} & \textbf{Value} & \textbf{Symbol} & \textbf{Value} \\
 \midrule
-New coverage & $+10\,(1+2C)$ per newly covered cell (worth more late in the episode) \\
-Sequential coverage & $+6$ if the new cell is adjacent to the previous one;
-  $+4$ more if it continues the same direction \\
-Boustrophedon lane change & $+8$ after a straight run of $\ge 2$ cells, a
-  one-cell perpendicular shift, and a new cell in the opposite direction \\
-Progress towards work & $+2$ per cell of geodesic approach to the nearest
-  believed-uncovered cell (routes through known free cells; exploration
-  frontiers when no known work remains) \\
-Loitering & $-0.2\,(1-\text{progress}/\text{full-speed progress})$ per step
-  without new coverage \\
-Off-axis motion & $-0.5\,(e/45^\circ)^2\,\|v\|/v_{\max}$, with $e$ the angle
-  between the motion and the nearest axis \\
-Spreading & $-0.5\,\max(0,1-d/2.5~\text{m})$ per teammate in communication range \\
-Re-coverage & $-w(\phi)\cdot\min(k,3)$ for the $k$-th consecutive entry into a
-  covered cell, with $w(\phi)=6\,[0.025+0.975(1-\phi)^2]$ and
-  $\phi=\max(C,\,t/T_{\max})$ \\
-Time & $-0.02$ per step \\
-Collision & $-2$ wall, $-5$ robot, $-10$ pedestrian \\
-Fallback activation & $-10$ once per activation \\
-Completion & $+200\,(1+\text{remaining time fraction})$, shared by the team \\
+$\alpha$, $g$                        & $10$, $2$          & $c_l$                                 & $0.2$ \\
+$B$, $\beta$                         & $200$, $1$         & $c_{\mathrm{rv}}$, $\eta$, $k_{\max}$ & $6$, $0.025$, $3$ \\
+$b_{\mathrm{seq}}$, $b_{\mathrm{str}}$, $b_{\mathrm{bou}}$ & $6$, $4$, $8$ & $w_s$, $r_s$       & $2$, $3$\,m \\
+$b_{\mathrm{ls}}$, $b_{\mathrm{lt}}$, $c_{\mathrm{lb}}$    & $3$, $3$, $5$ & $w_{\mathrm{los}}$, $r_{\mathrm{los}}$ & $1.5$, $5$\,m \\
+$c_{\mathrm{ax}}$                    & $0.5$              & $\eta_{\mathrm{los}}$, $T_d$          & $0.3$, $1500$ steps \\
+$\lambda_p$                          & $2$                & $\kappa_w$, $\kappa_r$, $\kappa_h$    & $2$, $5$, $10$ \\
+$\tau$                               & $0.02$             & $c_{\mathrm{fb}}$                     & $10$ \\
 \bottomrule
 \end{tabular}
-\end{center}
-
-\item \textbf{Rationale.}
-The sequential and lane-change terms reward Boustrophedon-like sweeps; the
-axis term favours horizontal and vertical lanes. The re-coverage penalty is
-high at the beginning and decays as coverage or time advances, since near the
-end of the episode crossing covered cells is unavoidable. Progress is
-potential-based (it telescopes to zero over loops), so a robot whose area is
-finished is pushed towards remaining work rather than idling. Coordination is
-implicit: there is no room assignment or goal negotiation.
+\end{table}
 
 \end{enumerate}
 
 %==========================================================================
-\section{Imitation Learning initialization}
+\section{Imitation learning initialization}
 
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
-\item \textbf{Motivation.}
-Systematic sweeping is hard to discover from rewards alone. The actor is
-therefore pre-trained by imitating a BCD expert, then fine-tuned with MAPPO.
+\item \textbf{Why imitation first.}
+A systematic sweep is hard to discover from rewards alone: at the start the
+policy moves randomly and rarely produces a clean lane. The actor is
+therefore first trained to imitate a classical expert, and reinforcement
+learning then refines this starting behaviour.
 
-\item \textbf{BCD expert (teacher, training only).}
-Offline, for each map, the free space is decomposed into rectangles, each
-swept with Boustrophedon lanes along its longer side; the rectangles are
-chained into a single ordered tour of all free cells. Online, the target of
-each robot is the nearest cell that is uncovered in the robot's own memory,
-ties broken by tour order (the next cell of the lane, or of the next lane at a
-lane end), so the decision depends only on information the actor also
-observes. A feedback law
-\[
- \omega=\omega_{\max}\tanh(k\,e),\qquad
- v=v_{\mathrm{cruise}}\,\max(\cos e,0)^{p}\,\mathrm{clearance}(\text{LiDAR})
-\]
-tracks a waypoint on the shortest path to the target ($e$ heading error,
-$v_{\mathrm{cruise}}=0.8$~m/s). Unsafe commands are replaced by DWA, and a
-blocked robot yields to a lower-id teammate. The decomposition uses the true
-layout, so the expert is privileged and exists only at training time.
+\item \textbf{BCD expert.}
+For each layout the expert splits the free space into rectangles, sweeps
+each rectangle in Boustrophedon lanes along its longer side, and chains the
+rectangles into a single tour of all free cells. The tour is cut into $N$
+pieces of similar length, one per robot. While driving, each robot heads for
+the first cell of its piece that its own map does not hold as covered.
 
 \item \textbf{Behaviour cloning with DAgger.}
-For $300$ iterations, rollouts are collected in which each robot executes the
-expert action with probability $\beta$ and the actor's action otherwise
-($\beta$ decays from $1$ to $0$ in $150$ iterations); the expert labels every
-visited state. The actor mean is trained on a replay of the last $32$ rollouts
-with a weighted MSE
-\[
- \mathcal L_{\mathrm{BC}}=\mathbb E\!\left[w\,\bigl\|\tanh(\mu_\theta(o))-a^{\mathrm{exp}}\bigr\|^2\right],
- \qquad w=1+2\min\bigl(\|a^{\mathrm{exp}}-a_{\mathrm{prev}}\|,1\bigr),
-\]
-which up-weights decision points (turns, lane shifts, stops). Only labels whose
-expert target lies inside the actor's $5\times5$ crop are used, so the actor
-is never asked to imitate information it cannot observe. The fallback is
-disabled in this phase.
+Rollouts are collected while the robots execute either the expert's command
+or the actor's own, with the share of expert commands decreasing over time.
+The expert labels every visited state, so the actor also learns to recover
+from situations it reaches by itself. The actor regresses the expert's
+velocity commands, with more weight on decisions that change the previous
+command, such as turns, lane shifts and stops. A label is used only when the
+expert's target lies inside the $5\times5$ core of the actor's crop: choosing
+a distant target requires planning over the whole map, which is left to
+reinforcement learning and to the recovery controller.
 
-\item \textbf{Critic warm-up.}
-With the actor frozen, the RL setup (reward, fallback, discount, GAE) runs for
-$100$ updates and only the critic is trained, so that PPO starts from the
-value of the policy it improves.
-
-\item \textbf{RL fine-tuning.}
-MAPPO resumes from the IL checkpoint with a pre-tanh exploration standard
-deviation of $0.3$. An optional BC term towards the expert can be kept during
-RL, decaying linearly to zero.
+\item \textbf{Transition to reinforcement learning.}
+Before MAPPO starts, the critic is warmed up on the imitation policy, with the
+actor frozen, so that PPO starts from a critic that already knows the value
+of the policy it is updating. MAPPO then fine-tunes the policy from this
+checkpoint, optionally keeping a decaying imitation term at the start.
 
 \end{enumerate}
 
 %==========================================================================
-\section{Fallback controller}
+\section{Recovery controller (fallback)}
 
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
 \item \textbf{Trigger.}
-Following the hybrid idea of \cite{carvalho2025deep}, a robot switches to the
-fallback after $7$ consecutive entries into covered cells or $70$ steps
-($7$~s) without covering a new cell.
+Following the hybrid idea of \cite{carvalho2025deep}, a robot switches to a
+classical controller when the learned policy is clearly stuck: after $7$
+consecutive entries into covered cells, or after $70$ steps ($7$~s) without
+covering a new cell.
 
 \item \textbf{Planning and execution.}
-A* selects the nearest reachable uncovered cell in the robot's own memory,
-routing through known free cells and respecting remembered walls. DWA
-($12$-step horizon, acceleration limits, current LiDAR clearance) follows the
-route. If DWA stops making progress for $30$ steps, a precomputed sequence of
-velocity commands ($\le 0.4$~m/s), checked against the latest LiDAR before each
-command, drives the robot along the route. The fallback keeps control until
-its goal cell is covered (by itself or a teammate), then returns control to the
-policy. It never uses the true map.
+A* selects the nearest uncovered cell that the robot's own map shows as
+reachable, routing only through known free cells. DWA follows the route,
+respecting acceleration limits and the current LiDAR clearance. If DWA stops
+making progress, a sequence of slow velocity commands ($\le 0.4$~m/s), each
+checked against the latest LiDAR, drives the robot along the route. The
+controller keeps control until the robot itself covers the goal cell; if a
+teammate covers it first, a new goal is planned. It never uses the true map.
 
 \item \textbf{Consistency with learning.}
-Steps controlled by the fallback are excluded from the PPO policy-gradient
-and entropy terms, since they are not samples from the actor; the critic
-still learns from all transitions. Collision-free fallback commands train the
-actor through a separate imitation loss (coefficient $0.5$). Results are
-reported both with the fallback (assisted) and without it (policy only).
+Steps driven by the recovery controller are not samples of the actor, so
+they are excluded from the PPO policy update; the critic still learns from
+all steps. Collision-free recovery commands train the actor through a
+separate imitation loss, so the policy gradually learns to get out of
+trouble by itself. Results are reported both with the controller (assisted)
+and without it (policy only).
 
 \end{enumerate}
 
@@ -375,19 +715,19 @@ reported both with the fallback (assisted) and without it (policy only).
 \begin{enumerate}[label=\textbf{\arabic*.},resume]
 
 \item \textbf{Metrics.}
-On held-out layouts and seeds: success (full coverage) rate, robot--robot,
-robot--wall and robot--pedestrian collision rates, timeout rate, completion
-time of successful episodes, re-coverage ratio (cell visits / distinct covered
-cells) and fallback usage. Policy-only and assisted runs are compared on the
-same seeds.
+Success (full coverage) rate; robot--robot, robot--wall and
+robot--pedestrian collision rates; timeout rate; completion time of
+successful episodes; re-coverage ratio (cell visits / distinct covered
+cells); and recovery usage. Policy-only and assisted runs are compared on
+the same random seeds.
 
 \item \textbf{To be defined.}
-Ablations on communication, personal map vs.\ distant summary, observation
-stacking vs.\ GRU, IL initialization and fallback; generalization to other
-team sizes, map sizes and pedestrian densities. Graph Attention Networks
-\cite{velivckovic2017graph}, reported to improve coordination in multi-agent
-exploration \cite{chiun2025marvel}, are a candidate for the actor--critic
-architecture.
+Ablations on communication, local crop vs.\ full map, observation stacking
+vs.\ GRU, IL initialization and recovery controller; generalization to
+unseen layouts and to other team sizes, map sizes and pedestrian densities.
+Graph Attention Networks \cite{velivckovic2017graph}, reported to improve
+coordination in multi-agent exploration \cite{chiun2025marvel}, are a
+candidate for the actor--critic architecture.
 
 \end{enumerate}
 
@@ -395,9 +735,9 @@ architecture.
 \section*{Open questions}
 
 \begin{enumerate}
-\item When two robots are very close, their observations are almost identical:
-how can they learn not to execute the same action? (The robot id and the
-teammate slots break the symmetry only partially.)
+\item When two robots are very close, their observations are almost
+identical: how can they learn not to execute the same action? The robot id
+and the teammate slots break the symmetry only partially.
 \end{enumerate}
 
 \bibliographystyle{IEEEtran}
