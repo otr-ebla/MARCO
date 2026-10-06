@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.envs.coverage_vector_env import MultiRobotCoverageEnv
+from src.envs.coverage_vector_env import FREE, OCCUPIED, MultiRobotCoverageEnv
 
 
 class CropBoundaryTests(unittest.TestCase):
@@ -28,8 +28,11 @@ class CropBoundaryTests(unittest.TestCase):
         positions = (cells + .5) * env.cell_size
         # Empty boundary cells ensure padding cannot pass by copying a wall.
         env.wall_grids = jnp.zeros_like(env.wall_grids)
+        env._cell_labels = jnp.full_like(env._cell_labels, FREE)
         state = state.replace(robot_positions=jnp.asarray(positions),
-                              coverage_grid=jnp.zeros_like(state.coverage_grid))
+                              coverage_grid=jnp.zeros_like(state.coverage_grid),
+                              mem_state=jnp.where(state.mem_state == OCCUPIED, FREE,
+                                                  state.mem_state).astype(jnp.int8))
         return env, state, positions
 
     def outside_mask(self, env, positions, heading=0.):
@@ -67,8 +70,8 @@ class CropBoundaryTests(unittest.TestCase):
         for known in (0., 1.):
             with self.subTest(interior_known=known):
                 obs = get_obs(state.replace(
-                    mem_known=jnp.full_like(state.mem_known, known),
-                    mem_covered=jnp.full_like(state.mem_covered, known),
+                    mem_state=env.belief_map(0, jnp.full(state.mem_state.shape, known),
+                                             jnp.full(state.mem_state.shape, known)),
                     # Memory crops stay grid-aligned regardless of heading.
                     robot_headings=jnp.full((env.num_robots,), np.pi / 4)))
                 crop = np.asarray(obs[:, env.frame_norm_dim:]).reshape(
@@ -94,18 +97,17 @@ class CropSummaryTests(unittest.TestCase):
         state = state.replace(
             robot_positions=jnp.asarray((cells + .5) * env.cell_size),
             coverage_grid=jnp.asarray(rng.random((env.grid_h, env.grid_w)) < .4, jnp.float32),
-            mem_known=jnp.asarray(rng.random(state.mem_known.shape) < .6, jnp.float32),
-            mem_covered=jnp.asarray(rng.random(state.mem_covered.shape) < .3, jnp.float32))
+            mem_state=env.belief_map(0, rng.random(state.mem_state.shape) < .6,
+                                     rng.random(state.mem_state.shape) < .3))
         return env, state, cells
 
     def expected_memory_ring(self, env, state, cells):
         """Brute force: slice each robot's memory into strips and quadrants."""
         h, s = env.local_coverage_size // 2, env.local_coverage_size
-        wall = np.asarray(env.wall_grids[0])
-        known, covered = np.asarray(state.mem_known), np.asarray(state.mem_covered)
+        mem = np.asarray(state.mem_state)
         out = np.zeros((env.num_robots, 4, s + 2, s + 2), np.float32)
         for robot, (col, row) in enumerate(cells):
-            maps = [known[robot] * wall, covered[robot], known[robot]]
+            maps = [mem[robot] == 1, mem[robot] == 3, mem[robot] != 0]
             spans = {0: (0, max(row - h, 0)), s + 1: (min(row + h + 1, env.grid_h), env.grid_h)}
             col_spans = {0: (0, max(col - h, 0)), s + 1: (min(col + h + 1, env.grid_w), env.grid_w)}
             for er in range(s + 2):
@@ -154,9 +156,9 @@ class CropSummaryTests(unittest.TestCase):
         east, north = at(state, 0.), at(state, np.pi / 2)
         # The ring averages each robot's memory, not the global coverage grid.
         robot, (col, row) = 4, cells[4]
-        known = np.asarray(state.mem_known[robot])
-        source = np.maximum(np.asarray(state.mem_covered[robot]),
-                            known * np.asarray(env.wall_grids[0]))
+        mem = np.asarray(state.mem_state[robot])
+        known = (mem != 0).astype(float)
+        source = ((mem == 3) | (mem == 1)).astype(float)
         h = s // 2
         # Facing north, the crop's +x side is the world's +y side.
         np.testing.assert_allclose(east[robot, 0, h + 1, -1], source[row, col + h + 1:].mean(), atol=1e-6)
@@ -168,8 +170,7 @@ class CropSummaryTests(unittest.TestCase):
         # and a wall counts only once the robot's memory knows the cell.
         hidden = at(state.replace(coverage_grid=1. - state.coverage_grid), 0.)
         np.testing.assert_array_equal(hidden, east)
-        blind = at(state.replace(mem_known=jnp.zeros_like(state.mem_known),
-                                 mem_covered=jnp.zeros_like(state.mem_covered)), 0.)
+        blind = at(state.replace(mem_state=jnp.zeros_like(state.mem_state)), 0.)
         inside = blind[:, 2, 1:-1, 1:-1] == 1.
         np.testing.assert_array_equal(blind[:, 0, 1:-1, 1:-1][inside], 0.)
         # A robot in the corner sees nothing beyond the map edge.
@@ -203,11 +204,10 @@ class CropSummaryTests(unittest.TestCase):
         state = state.replace(last_discovery=jnp.array([[2, 2]]),
                               sweep_direction=jnp.array([[1, 0]]),
                               lane_return=jnp.zeros((1, 2), jnp.int32),
-                              mem_blocked=jnp.zeros_like(state.mem_blocked),
-                              mem_covered=jnp.zeros_like(state.mem_covered))
-        env.wall_grids = env.wall_grids.at[0, 2, 3].set(1.)
-        unseen = state.replace(mem_known=jnp.zeros_like(state.mem_known))
-        seen = state.replace(mem_known=jnp.ones_like(state.mem_known))
+                              mem_state=jnp.zeros_like(state.mem_state))
+        # A wall at the cell ahead counts only once it is in the belief map.
+        unseen = state
+        seen = state.replace(mem_state=state.mem_state.at[0, 2, 3].set(1))
         self.assertTrue(bool(env._sweep_preference(unseen)[3][0]))
         self.assertFalse(bool(env._sweep_preference(seen)[3][0]))
 

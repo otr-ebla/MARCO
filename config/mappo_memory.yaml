@@ -1,4 +1,5 @@
-# Memory actor: Neural-Map-style read of the personal map + GRU, cloned on sequences.
+# Memory actor: frame encoder (state, lidar, local crop) + GRU, cloned on sequences.
+# The personal map stays in the robot and reaches the policy only via the crop.
 #   python -m src.pretrain_bc --config config/mappo_memory.yaml \
 #       --policy-mode end-to-end-memory --save-dir checkpoints/bc_memory
 #   python -m src.train_marl  --config config/mappo_memory.yaml \
@@ -37,19 +38,15 @@ env:
   comm_radius: 3.0
   comm_slots: 2
   local_coverage_size: 5
+  crop_mode: directional       # 7x7: [obstacle, covered, robots] + ring of per-channel means beyond each side
   use_full_memory: true
   observation_stack: 1         # the GRU carries short-term history instead of a frame stack
   critic_stack: 5              # ordered global frames, with every robot's visit counts
 
 model:
   hidden_size: 256             # trunk width and GRU state
-  # Personal map re-centred on the robot, read by a deep CNN (global) and
-  # multi-head attention over 2x2 blocks (context): see SpatialMemoryRead.
-  map_encoder: spatial_memory
-  map_embed: 256
-  attention_heads: 4
-  attention_dim: 16
   lidar_embed: 64
+  crop_encoder: cnn             # 2D CNN over the occupied/covered/known crop layers
   critic_hidden: 256
   critic_map_embed: 128
   # Pre-tanh sigma floor ~0.10; action-space noise can still shrink at saturation.

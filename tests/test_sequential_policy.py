@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from src.algorithms.mappo import rms_init, rms_normalize, rms_update
-from src.envs.coverage_vector_env import MultiRobotCoverageEnv, _FAR
+from src.envs.coverage_vector_env import COVERED, FREE, OCCUPIED, MultiRobotCoverageEnv, _FAR
 from src.envs.vec_env import VecEnv
 from src.models.actor_critic import Actor, LocalCritic
 from src.algorithms.mappo import Transition
@@ -55,19 +55,23 @@ class SequentialPolicyTests(unittest.TestCase):
         np.testing.assert_array_equal(state.obs_history[1, :, :-1], previous[1, :, 1:])
         np.testing.assert_array_equal(obs, jax.vmap(vec.env.get_obs)(state))
 
-    def test_distant_work_visible_without_ground_truth_leak(self):
+    def test_distant_memory_and_ground_truth_stay_out_of_actor_obs(self):
         env, state = self.env, self.state
         # Only three nearby cells and a distant cell are known. The personal map
-        # must expose that distant cell even though it is outside the local crop.
+        # stays in the robot: the actor sees memory only through the local crop,
+        # so covering the distant cell changes no observation.
+        self.assertEqual(env.memory_map_shape, ())
         pos = jnp.array([[1.25, 1.25], [8.25, 5.25], [10.25, 5.25]])
-        known = jnp.zeros_like(state.mem_known).at[:, 2, 2:5].set(1).at[:, 14, 2].set(1)
-        state = state.replace(robot_positions=pos, mem_known=known,
-                              mem_covered=jnp.zeros_like(known))
+        known = jnp.zeros(state.mem_state.shape).at[:, 2, 2:5].set(1).at[:, 14, 2].set(1)
+        state = state.replace(robot_positions=pos, mem_state=env.belief_map(0, known))
         first = env._get_frame_obs(state)
-        changed = env._get_frame_obs(state.replace(mem_covered=known.at[:, 2, 2:5].set(0)))
-        local_end = env.frame_norm_dim + 3 * env.local_coverage_size ** 2
-        np.testing.assert_array_equal(first[:, :local_end], changed[:, :local_end])
-        self.assertFalse(np.array_equal(first[:, local_end:], changed[:, local_end:]))
+        self.assertEqual(first.shape[1], env.frame_norm_dim + env.patch_dim)
+        changed = env._get_frame_obs(state.replace(
+            mem_state=env.belief_map(0, known, known.at[:, 2, 2:5].set(0))))
+        np.testing.assert_array_equal(first, changed)
+        nearby = env._get_frame_obs(state.replace(
+            mem_state=env.belief_map(0, known, known.at[:, 14, 2].set(0))))
+        self.assertFalse(np.array_equal(first[0], nearby[0]))
         hidden_coverage = env._get_frame_obs(state.replace(coverage_grid=jnp.ones_like(state.coverage_grid)))
         np.testing.assert_array_equal(first, hidden_coverage)
         walls = env.wall_grids
@@ -82,17 +86,12 @@ class SequentialPolicyTests(unittest.TestCase):
 
     def test_known_routes_do_not_cross_unknown_or_walls(self):
         env, state = self.env, self.state
-        walls = env.wall_grids
-        try:
-            env.wall_grids = jnp.zeros_like(walls).at[:, 3, 4].set(1)
-            known = jnp.zeros_like(state.mem_known).at[:, 3, 2:7].set(1)
-            state = state.replace(mem_known=known, mem_covered=jnp.zeros_like(known))
-            field = env._known_work_field(state)
-            self.assertTrue(np.all(np.asarray(field[:, 3, 4]) >= _FAR))
-            self.assertTrue(np.all(np.asarray(field[:, 10, 10]) >= _FAR))
-            self.assertTrue(np.all(np.asarray(field[:, 3, 3]) == 0))
-        finally:
-            env.wall_grids = walls
+        # A known row of free cells with an occupied cell in the middle.
+        mem = jnp.zeros_like(state.mem_state).at[:, 3, 2:7].set(FREE).at[:, 3, 4].set(OCCUPIED)
+        field = env._known_work_field(state.replace(mem_state=mem))
+        self.assertTrue(np.all(np.asarray(field[:, 3, 4]) >= _FAR))
+        self.assertTrue(np.all(np.asarray(field[:, 10, 10]) >= _FAR))
+        self.assertTrue(np.all(np.asarray(field[:, 3, 3]) == 0))
 
     def test_sequential_bonus_requires_fresh_adjacent_discovery(self):
         env = self.env
@@ -108,21 +107,16 @@ class SequentialPolicyTests(unittest.TestCase):
             env._sequential_discovery_reward(self.state, cells, jnp.ones(3, bool)), 0)
 
     def test_known_work_takes_priority_over_covered_frontier(self):
-        env, walls = self.env, self.env.wall_grids
-        try:
-            env.wall_grids = jnp.zeros_like(walls)
-            known = jnp.zeros_like(self.state.mem_known).at[:, 3, 2:7].set(1)
-            covered = known.at[:, 3, 6].set(0)
-            pos = jnp.array([[1.25, 1.75]] * 3)  # col 2, row 3
-            state = self.state.replace(robot_positions=pos, mem_known=known, mem_covered=covered)
-            field = env._known_work_field(state)
-            np.testing.assert_array_equal(field[:, 3, 2], 4)
-            np.testing.assert_array_equal(field[:, 3, 6], 0)
-            # Once known work is done, the covered frontier becomes a valid target.
-            field = env._known_work_field(state.replace(mem_covered=known))
-            np.testing.assert_array_equal(field[:, 3, 2], 0)
-        finally:
-            env.wall_grids = walls
+        env = self.env
+        covered = jnp.zeros_like(self.state.mem_state).at[:, 3, 2:7].set(COVERED)
+        pos = jnp.array([[1.25, 1.75]] * 3)  # col 2, row 3
+        state = self.state.replace(robot_positions=pos, mem_state=covered.at[:, 3, 6].set(FREE))
+        field = env._known_work_field(state)
+        np.testing.assert_array_equal(field[:, 3, 2], 4)
+        np.testing.assert_array_equal(field[:, 3, 6], 0)
+        # Once known work is done, the covered frontier becomes a valid target.
+        field = env._known_work_field(state.replace(mem_state=covered))
+        np.testing.assert_array_equal(field[:, 3, 2], 0)
 
     def test_spreading_only_uses_observable_teammates(self):
         env = self.env
@@ -152,6 +146,24 @@ class SequentialPolicyTests(unittest.TestCase):
         critic = LocalCritic(**kwargs)
         params = critic.init(jax.random.PRNGKey(2), obs)
         self.assertEqual(jax.jit(critic.apply)(params, obs).shape, (3, 1))
+
+    def test_crop_cnn_reads_every_frame_crop_and_nothing_else_as_image(self):
+        env = self.env
+        obs = env.get_obs(self.state)
+        self.assertEqual(env.crop_shape, (3, env.local_coverage_size, env.local_coverage_size))
+        kwargs = dict(vec_dim=env.obs_vec_dim, n_rays=env.n_rays, tail_dim=env.patch_dim,
+                      observation_stack=5, crop_shape=env.crop_shape, crop_encoder='cnn',
+                      hidden_size=16, lidar_embed=8)
+        actor = Actor(**kwargs)
+        params = actor.init(jax.random.PRNGKey(1), obs)
+        kernels = [x.shape for x in jax.tree_util.tree_leaves(params) if x.ndim == 4]
+        self.assertEqual(kernels, [(3, 3, 3, 16), (3, 3, 16, 32)])
+        # One covered cell in the oldest frame's crop changes the action mean.
+        crop_start = env.norm_dim
+        changed = obs.at[:, crop_start + env.crop_dim // 3].set(1. - obs[:, crop_start + env.crop_dim // 3])
+        self.assertFalse(np.allclose(actor.apply(params, obs)[0], actor.apply(params, changed)[0]))
+        critic = LocalCritic(**kwargs)
+        self.assertEqual(critic.apply(critic.init(jax.random.PRNGKey(2), obs), obs).shape, (3, 1))
 
 
 class SweepRewardTests(unittest.TestCase):
@@ -301,7 +313,7 @@ class SweepShapingTests(unittest.TestCase):
 
     def test_lane_end_turn_then_reverse(self):
         state = self.east_twice()
-        state = state.replace(mem_covered=state.mem_covered.at[0, 2, 5].set(1.))
+        state = state.replace(mem_state=state.mem_state.at[0, 2, 5].set(COVERED))
         obs = self.env.get_obs(state)[0, self.env.obs_vec_dim - 3:self.env.obs_vec_dim]
         np.testing.assert_allclose(obs, [1., 0., 0.])        # east, lane finished
         # Shift north at the lane end, reverse west, continue west.

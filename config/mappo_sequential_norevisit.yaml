@@ -112,10 +112,10 @@ e2e_reward:
   sequential_bonus: 6.0
   straight_bonus: 4.0
   boustrophedon_bonus: 8.0  # straight run -> adjacent lane -> reverse on new cells
-  revisit_cost: 6.0        # high initial cost per entry, multiplied by a capped streak
-  revisit_end_fraction: 0.025 # decays to 0.15 by completion or timeout
+  revisit_cost: 15.0       # fine-tune: re-coverage heavily penalised (was 6.0)
+  revisit_end_fraction: 0.4   # floor 6.0 per entry late in the episode (was 0.025 -> 0.15)
   revisit_decay_power: 2.0    # phase = max(coverage fraction, elapsed episode fraction)
-  revisit_streak_cap: 3       # bound the cost of necessary transit
+  revisit_streak_cap: 5       # up to 75 per entry on long re-coverage streaks (was 3)
   fallback_cost: 10.0      # once per successful recovery activation
   axis_alignment_cost: 0.5 # (error / 45 degrees)^2, scaled by actual travel speed
   progress_weight: 2.0

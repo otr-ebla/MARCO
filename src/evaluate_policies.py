@@ -124,12 +124,15 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     recurrent = checkpoint.get("actor_recurrent", False)
     env_cfg.update(checkpoint.get("reward_weights", {}))
     env_cfg.update({"use_full_memory": False, "observation_stack": 1, "sweep_obs": False,
-                    "crop_summary": False, "critic_crops": False,
+                    "crop_summary": False, "crop_mode": "memory", "critic_crops": False,
                            "known_coverage_obs": False, "critic_coverage": False,
                     "goal_obs": False, "wall_cells": 0,
                            "history_cell": "last_discovery", "critic_context": False,
                            "critic_stack": 1})
-    env_cfg.update(checkpoint.get("obs_config", {"obs_mode": "legacy"}))
+    obs_config = checkpoint.get("obs_config", {"obs_mode": "legacy"})
+    env_cfg.update(obs_config)
+    # Checkpoints older than memory_map_obs read the full map with use_full_memory.
+    env_cfg["memory_map_obs"] = bool(obs_config.get("memory_map_obs", obs_config.get("use_full_memory", False)))
     if policy_only:
         env_cfg['fallback_enabled'] = False
     vec_env = VecEnv(min(batch_size, episodes), env_cfg)
@@ -140,7 +143,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     actor_cfg.update(checkpoint.get("actor_config", {}))
     actor = Actor(recurrent=recurrent, action_dim=env.action_dim, vec_dim=env.obs_vec_dim,
                   n_rays=env.n_rays, tail_dim=env.patch_dim,
-                  memory_map_shape=env.memory_map_shape,
+                  memory_map_shape=env.memory_map_shape, crop_shape=env.crop_shape,
                   observation_stack=env.observation_stack, **actor_cfg)
     params = jax.device_put(checkpoint["actor_params"], device)
     rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))

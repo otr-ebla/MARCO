@@ -408,12 +408,14 @@ def build_env_config(config: dict, num_maps: int | None = None, num_humans: int 
 def observation_config(env) -> dict:
     """Env keys that fix the actor's input layout and the recovery controller."""
     obs_config = {'obs_mode': env.obs_mode, 'use_full_memory': env.use_full_memory,
+                  'memory_map_obs': env.memory_map_obs,
                   'observation_stack': env.observation_stack,
                   'num_robots': env.num_robots, 'n_rays': env.n_rays,
                   'cell_size': env.cell_size, 'k_teammates': env.k_teammates,
                   'local_coverage_size': env.local_coverage_size,
                   'use_local_coverage_obs': env.use_local_coverage_obs,
                   'sweep_obs': env.sweep_obs, 'crop_summary': env.crop_summary,
+                  'crop_mode': env.crop_mode,
                   'history_cell': env.history_cell,
                   'critic_context': env.critic_context, 'critic_stack': env.critic_stack,
                   'critic_crops': env.critic_crops,
@@ -442,6 +444,9 @@ def build_learner(vec_env: VecEnv, model_cfg: dict, train_cfg: dict, policy_mode
     actor_config = dict(lidar_embed=lidar_embed, hidden_size=hidden_size,
                         log_std_min=model_cfg.get('log_std_min', -5.0),
                         log_std_max=model_cfg.get('log_std_max', 1.0))
+    crop_encoder = model_cfg.get('crop_encoder', 'flat')
+    if crop_encoder != 'flat':
+        actor_config.update(crop_encoder=crop_encoder)   # stored in the checkpoint
     if model_cfg.get('map_encoder', 'cnn') != 'cnn':
         # Stored in the checkpoint, so evaluators rebuild the same actor.
         actor_config.update(map_encoder=model_cfg['map_encoder'],
@@ -456,6 +461,7 @@ def build_learner(vec_env: VecEnv, model_cfg: dict, train_cfg: dict, policy_mode
         tail_dim=env.patch_dim,
         memory_map_shape=env.memory_map_shape,
         observation_stack=env.observation_stack,
+        crop_shape=env.crop_shape,
         **actor_config,
     )
     if algo == 'ippo':
@@ -465,6 +471,8 @@ def build_learner(vec_env: VecEnv, model_cfg: dict, train_cfg: dict, policy_mode
             tail_dim=env.patch_dim,
             memory_map_shape=env.memory_map_shape,
             observation_stack=env.observation_stack,
+            crop_shape=env.crop_shape,
+            crop_encoder=crop_encoder,
             lidar_embed=lidar_embed,
             hidden_size=model_cfg.get('critic_hidden', 256),
         )

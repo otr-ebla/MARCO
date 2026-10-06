@@ -11,6 +11,7 @@ from src.models.actor_critic import Actor, egocentric_memory, latest_memory_map
 from src.envs.coverage_vector_env import MultiRobotCoverageEnv
 
 CONFIG = dict(num_maps=2, num_robots=3, n_rays=70, obs_mode='memory_comm', use_full_memory=True,
+              memory_map_obs=True,  # legacy layout read by SpatialMemoryRead
               history_cell='previous_visit', reward_mode='sequential', max_steps=200)
 
 

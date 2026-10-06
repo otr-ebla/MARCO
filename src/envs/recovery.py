@@ -156,22 +156,29 @@ def velocity_sequence(env, position, heading, velocity, route, length):
     return commands, jnp.sum(valid.astype(jnp.int32))
 
 
-def command_safety_flags(env, position, heading, command, lidar, free, blocked_edges):
+def command_safety_flags(env, position, heading, command, lidar, free, blocked_edges=None):
     """Rejection bitmask: 1 boundary, 2 unknown/occupied, 4 wall edge, 8 lidar.
 
     Check the next command and its braking trajectory against the latest scan.
+    blocked_edges (H, W, 4) is optional: the belief map stores walls as
+    occupied cells, so only planners on the true geometry pass edges.
 
     Directional braking checks let a robot rotate or move away from a nearby
     obstacle even when it starts inside DWA's preferred clearance margin.
     """
+    if blocked_edges is None:
+        blocked_edges = jnp.zeros((*free.shape, 4), bool)
     hits = lidar_points(env, position, heading, lidar)
     initial_clearance = jnp.min(jnp.where(lidar < 1., lidar * env.max_lidar_range, env.max_lidar_range))
     # A nearby wall is sampled at discrete points. Parallel motion changes
     # distance to those samples even when true wall clearance is constant.
     # Inside the preferred buffer, enforce physical clearance instead of
     # requiring the sampled minimum to never decrease.
-    clearance_limit = jnp.where(initial_clearance >= env.robot_radius + .01,
-                                env.robot_radius + .01, env.robot_radius)
+    # Inside robot_radius already, accept commands that do not get closer;
+    # otherwise rotation in place is rejected too and the robot freezes.
+    clearance_limit = jnp.minimum(jnp.where(initial_clearance >= env.robot_radius + .01,
+                                            env.robot_radius + .01, env.robot_radius),
+                                  initial_clearance)
 
     def step(carry, index):
         pos, hdg, speed, flags = carry
@@ -187,7 +194,7 @@ def command_safety_flags(env, position, heading, command, lidar, free, blocked_e
         wall = ((edges[0] & (r < old_r[0])) | (edges[1] & (r > old_r[0]))
                 | (edges[2] & (c < old_c[0])) | (edges[3] & (c > old_c[0])))
         nearest = jnp.min(jnp.where(lidar < 1., jnp.linalg.norm(new_pos - hits, axis=-1), env.max_lidar_range))
-        clear = (nearest >= clearance_limit - 1e-5) & (nearest >= env.robot_radius - 1e-5)
+        clear = nearest >= clearance_limit - 1e-5
         rejected = ((~inside).astype(jnp.int32)
                     | ((~known_free).astype(jnp.int32) * 2)
                     | (wall.astype(jnp.int32) * 4)
@@ -201,16 +208,18 @@ def command_safety_flags(env, position, heading, command, lidar, free, blocked_e
     return flags
 
 
-def command_is_safe(env, position, heading, command, lidar, free, blocked_edges):
+def command_is_safe(env, position, heading, command, lidar, free, blocked_edges=None):
     return command_safety_flags(env, position, heading, command, lidar, free, blocked_edges) == 0
 
 
-def dwa(env, position, heading, velocity, lidar, free, waypoint, blocked_edges):
+def dwa(env, position, heading, velocity, lidar, free, waypoint, blocked_edges=None):
     """Acceleration-limited trajectory search, with lidar braking clearance.
 
     A zero-speed emergency stop is always available. Unknown map cells and
     lidar hits (including people and robots) block candidate trajectories.
     """
+    if blocked_edges is None:
+        blocked_edges = jnp.zeros((*free.shape, 4), bool)
     dv = env.fallback_linear_accel * env.dt
     dw = env.fallback_angular_accel * env.dt
     vs = jnp.linspace(jnp.maximum(0., velocity[0] - dv),
@@ -250,7 +259,9 @@ def dwa(env, position, heading, velocity, lidar, free, waypoint, blocked_edges):
         # of clearance. Sparse lidar hits can overestimate distance to the
         # wall between rays; allowing approach down to exactly robot_radius
         # caused grazing collisions. Rotation and motion away remain valid.
-        clearance_limit = jnp.minimum(preferred, jnp.maximum(initial_clearance, env.robot_radius))
+        # Already inside robot_radius (a person stopped next to the robot):
+        # rotating or moving away must stay valid, or both wait forever.
+        clearance_limit = jnp.minimum(preferred, initial_clearance)
         safe = nearest >= clearance_limit - 1e-5
         return (pos, hdg, valid & inside & known_free & ~crossed_wall & safe, clearance), None
 

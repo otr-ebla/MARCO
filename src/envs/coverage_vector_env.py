@@ -8,6 +8,7 @@ and scanned over time without leaving the accelerator.
 
 from __future__ import annotations
 
+import warnings
 from collections import deque
 
 import jax
@@ -22,6 +23,10 @@ from .map_layouts import ProceduralMapLayout, create_map_bank
 _TWO_PI = 2.0 * np.pi
 _BIG = 1.0e9
 _FAR = 1.0e6   # geodesic distance of a cell that cannot reach any target
+
+# Belief-map cell states, ordered so that merging two maps is a cell-wise max:
+# an unseen cell never overrides a seen one and covered overrides uncovered.
+UNKNOWN, OCCUPIED, FREE, COVERED = 0, 1, 2, 3
 
 # Training defaults; checkpoints persist this complete reward specification.
 # 'local_coverage_v1' is kept only so older checkpoints still evaluate.
@@ -81,12 +86,11 @@ class EnvState:
     human_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
     ghost_robot_prob: jax.Array   # ()       float32 — humans ignore robots with this probability
     # Decentralised per-robot memory (also maintained for legacy-mode recovery).
-    # Dense bitmaps are the jit/vmap-friendly form of a sparse cell dictionary.
-    # Occupancy is not stored: a known cell's label is the static ground truth,
-    # so occupied = mem_known & wall.
-    mem_known:        jax.Array   # (N, H, W) float32 — 0.0 / 1.0, observed by lidar or shared
-    mem_blocked:      jax.Array   # (N, H, W, 4) bool — observed wall edges: S,N,W,E
-    mem_covered:      jax.Array   # (N, H, W) float32 — 0.0 / 1.0, covered as far as robot i knows
+    # Per-robot belief map: a cell dictionary {(row, col): state} stored as a
+    # fixed-shape int8 grid so it can be jitted and vmapped. UNKNOWN marks a
+    # key not yet in the dictionary; OCCUPIED / FREE / COVERED are written
+    # when a cell is first seen (lidar) or covered (footprint), never erased.
+    mem_state:        jax.Array   # (N, H, W) int8 — UNKNOWN / OCCUPIED / FREE / COVERED
     lidar:            jax.Array   # (N, R)    float32 — latest normalised scan
     last_discovery:   jax.Array   # (N, 2) int32 — last new (col, row), -1 at reset
     sweep_direction:  jax.Array   # (N, 2) int32 — last adjacent discovery direction
@@ -115,7 +119,7 @@ class EnvState:
     fallback_count:   jax.Array   # (N,) activation count this episode
     fallback_stagnation: jax.Array # (N,) steps without improving remaining route distance
     fallback_best_distance: jax.Array # (N,) best remaining route distance for current goal
-    fallback_observed_edges: jax.Array # (N,) topology version for the progress baseline
+    fallback_observed_cells: jax.Array # (N,) known-cell count for the progress baseline
     fallback_sequence: jax.Array  # (N,) sequence mode after DWA stalls
     fallback_commands: jax.Array # (N, K, 2) queued physical (v, omega) commands
     fallback_command_index: jax.Array # (N,) next queued command
@@ -197,6 +201,10 @@ class MultiRobotCoverageEnv:
         self.critic_context = bool(cfg.get('critic_context', False))
         self.fallback_enabled = bool(cfg.get('fallback_enabled', True))
         self.track_memory = self.use_memory or self.fallback_enabled
+        if self.track_memory and int(cfg.get('wall_cells', 1)) == 0:
+            # The belief map stores cells only: a thin wall lying between two
+            # free cells is invisible to it, so planning would cross it.
+            warnings.warn('wall_cells=0: thin walls are not represented in the belief map')
         self.fallback_revisit_threshold = int(cfg.get('fallback_revisit_threshold', 7))
         self.fallback_stall_steps = int(cfg.get('fallback_stall_steps', 70))
         self.fallback_linear_accel = float(cfg.get('fallback_linear_accel', 1.0))
@@ -212,7 +220,12 @@ class MultiRobotCoverageEnv:
                self.fallback_dwa_steps, self.fallback_dwa_stall_steps,
                self.fallback_sequence_steps) <= 0:
             raise ValueError('Fallback thresholds, accelerations and horizon must be positive')
+        # Past-cell history (previous visit, sweep direction) in the actor vector.
         self.use_full_memory = bool(cfg.get('use_full_memory', False))
+        # The whole personal map as actor input. Off: the map lives in the robot
+        # and reaches the policy only through the local crop. On only to
+        # evaluate checkpoints trained with it.
+        self.memory_map_obs = bool(cfg.get('memory_map_obs', False))
         # Preferred lane direction and whether its next cell is open work;
         # memory_comm only, the legacy observation layout is left unchanged.
         self.sweep_obs = bool(cfg.get('sweep_obs', False)) and self.use_memory
@@ -222,6 +235,17 @@ class MultiRobotCoverageEnv:
             self.use_memory or self.use_local_coverage_obs)
         if self.use_local_coverage_obs and not self.track_memory:
             raise ValueError('The actor crop reads robot memory: needs memory_comm or fallback_enabled')
+        # 'directional': [obstacle, covered, robots] S x S crop inside a ring
+        # holding each channel's mean beyond each side; see
+        # _directional_crops. 'memory': [occupied, covered, known], optionally
+        # with crop_summary (checkpoints trained before 'directional').
+        self.crop_mode = cfg.get('crop_mode', 'memory')
+        if self.crop_mode not in ('memory', 'directional'):
+            raise ValueError(f'Unknown crop_mode: {self.crop_mode}')
+        if self.crop_mode == 'directional' and (not self.use_memory or self.crop_summary):
+            raise ValueError("crop_mode='directional' needs memory_comm and replaces crop_summary")
+        # Bit-packable crop: only binary values (see pretrain_bc's replay buffer).
+        self.crop_binary = not self.crop_summary and self.crop_mode == 'memory'
         # CTDE: the critic also reads every robot's actor crop (see critic_inputs).
         self.critic_crops = bool(cfg.get('critic_crops', False)) and (
             self.use_memory or self.use_local_coverage_obs)
@@ -237,8 +261,11 @@ class MultiRobotCoverageEnv:
         self.critic_stack = int(cfg.get('critic_stack', 1))
         if self.critic_stack < 1:
             raise ValueError('critic_stack must be positive')
-        if (self.use_full_memory or self.reward_mode == 'sequential') and not self.use_memory:
+        if (self.use_full_memory or self.memory_map_obs or self.reward_mode == 'sequential') \
+                and not self.use_memory:
             raise ValueError('Full memory and sequential reward require obs_mode=memory_comm')
+        if self.memory_map_obs and not self.use_full_memory:
+            raise ValueError('memory_map_obs requires use_full_memory')
         self.comm_radius = float(cfg.get('comm_radius', 3.0))
         self.comm_slots = int(cfg.get('comm_slots', max(self.num_robots - 1, 0)))
         if self.comm_radius < 0.0 or self.comm_slots < 0:
@@ -362,6 +389,8 @@ class MultiRobotCoverageEnv:
         self._free_flat   = self.free_masks.reshape(self.num_maps, -1)
         self.free_totals  = jnp.sum(self.free_masks, axis=(1, 2))
         self.wall_grids   = 1.0 - self.free_masks
+        # Label a seen cell enters the belief map with: (M, H*W) int8.
+        self._cell_labels = jnp.where(self._free_flat > 0.0, FREE, OCCUPIED).astype(jnp.int8)
         
         if np.any(self.free_totals < self.num_robots):
             raise RuntimeError("Free space is too small in one of the procedural maps.")
@@ -373,28 +402,32 @@ class MultiRobotCoverageEnv:
         self.room_totals = jnp.sum(self.room_masks, axis=(2, 3))     # (M, 1)
 
         # -- Derived dims --
-        crop_side = self.local_coverage_size + (2 if self.crop_summary else 0)
+        ringed = self.crop_summary or self.crop_mode == 'directional'
+        crop_side = self.local_coverage_size + (2 if ringed else 0)
         # Summary adds an extent channel, and a known channel to the legacy patch.
         crop_extra = (1 if self.use_memory else 2) if self.crop_summary else 0
         if self.use_memory:
             # pose (x, y, cos, sin) + (v, omega) + own id + (id, dx, dy) per slot
             self.obs_vec_dim = 4 + 2 + 1 + 3 * self.comm_slots
-            # [occupied, covered, known] crop from the robot's memory
+            # [occupied, covered, known] or [obstacle, covered, robots] crop
             self.crop_dim    = (3 + crop_extra) * crop_side ** 2
+            self.crop_shape  = (3 + crop_extra, crop_side, crop_side)
         else:
             self.obs_vec_dim = 2 + self.k_teammates * 2
             self.crop_dim    = (
                 (1 + crop_extra) * crop_side ** 2 if self.use_local_coverage_obs else 0
             )
+            self.crop_shape  = ((1 + crop_extra, crop_side, crop_side)
+                                if self.use_local_coverage_obs else ())
         self.patch_dim = self.crop_dim
         self.norm_dim      = self.obs_vec_dim + self.n_rays
-        # Full personal map: occupied, covered, known, self, visible teammates.
-        # Keep the fine local crop too; distant isolated cells must not disappear
-        # through pooling before the spatial encoder sees them.
-        self.memory_map_shape = (5, self.grid_h, self.grid_w) if self.use_full_memory else ()
+        # Full personal map (occupied, covered, known, self, visible teammates),
+        # only with memory_map_obs; see __init__.
+        self.memory_map_shape = (5, self.grid_h, self.grid_w) if self.memory_map_obs else ()
         if self.use_full_memory:
             self.obs_vec_dim += 5  # past cell: valid, dx, dy, historical sweep dx/dy
             self.norm_dim = self.obs_vec_dim + self.n_rays
+        if self.memory_map_obs:
             self.patch_dim += 5 * self.num_cells
         if self.sweep_obs:
             self.obs_vec_dim += 3  # preferred lane dx/dy, next lane cell open
@@ -585,8 +618,7 @@ class MultiRobotCoverageEnv:
         return (jnp.clip(cols, 0, self.grid_w - 1), jnp.clip(rows, 0, self.grid_h - 1),
                 touch, d2)
 
-    def _geodesic_distance(self, targets: jax.Array, free: jax.Array,
-                           blocked: jax.Array | None = None) -> jax.Array:
+    def _geodesic_distance(self, targets: jax.Array, free: jax.Array) -> jax.Array:
         """Multi-source 4-connected distance, in cells, from every free cell to
         the nearest target cell. Cells that reach no target hold `_FAR`.
 
@@ -599,8 +631,6 @@ class MultiRobotCoverageEnv:
             pad = jnp.pad(d, lead + [(1, 1), (1, 1)], constant_values=far)
             neighbors = jnp.stack([pad[..., :-2, 1:-1], pad[..., 2:, 1:-1],
                                    pad[..., 1:-1, :-2], pad[..., 1:-1, 2:]], axis=-1)
-            if blocked is not None:
-                neighbors = jnp.where(blocked, far, neighbors)
             nb = jnp.min(neighbors, axis=-1)
             return jnp.where(free, jnp.minimum(d, nb + 1.0), far)
 
@@ -617,8 +647,7 @@ class MultiRobotCoverageEnv:
         d, _, _ = jax.lax.while_loop(cond, body, (d0, jnp.bool_(True), jnp.int32(0)))
         return d
 
-    def _work_distance(self, dist: jax.Array, pos: jax.Array,
-                       blocked: jax.Array | None = None) -> jax.Array:
+    def _work_distance(self, dist: jax.Array, pos: jax.Array) -> jax.Array:
         """Continuous distance, in cells, from each robot to its nearest target.
 
         dist : (N, H, W) per-robot geodesic field; pos : (N, 2) metres.
@@ -633,13 +662,6 @@ class MultiRobotCoverageEnv:
         r = jnp.clip(r, 0, self.grid_h - 1)
         c = jnp.clip(c, 0, self.grid_w - 1)
         d = jnp.where(inside, dist[self._robot_ids[:, None], r, c], _FAR)
-        if blocked is not None:
-            # Neighbour order here is own,N,S,E,W; edge order is S,N,W,E.
-            closed = blocked[self._robot_ids, row, col][:, jnp.array([1, 0, 3, 2])]
-            closed = jnp.concatenate([jnp.zeros((self.num_robots, 1), bool), closed], axis=1)
-            # Never interpolate out of an unreachable cell through a wall.
-            reachable = dist[self._robot_ids, row, col] < .5 * _FAR
-            d = jnp.where(~closed & reachable[:, None], d, _FAR)
         centre = (jnp.stack([c, r], axis=-1).astype(jnp.float32) + 0.5) * self.cell_size
         offset = jnp.linalg.norm(pos[:, None, :] - centre, axis=-1) / self.cell_size
         return jnp.min(d + offset, axis=1)
@@ -726,6 +748,42 @@ class MultiRobotCoverageEnv:
             self._cast_lidar_single, in_axes=(0, 0, None, 0, None, None, None)
         )(state.robot_positions, state.robot_headings, state.robot_positions, not_self, state.map_id, state.human_positions, state.human_headings)
 
+    def belief_map(self, map_id, known, covered=None) -> jax.Array:
+        """(..., H, W) int8 belief map from boolean seen / covered masks.
+
+        Seen cells take their label (OCCUPIED or FREE); covered free cells
+        become COVERED and count as seen. For tests and tooling.
+        """
+        labels = self._cell_labels[map_id].reshape(self.grid_h, self.grid_w)
+        seen = jnp.asarray(known) > 0.5
+        mem = jnp.where(seen, labels, UNKNOWN)
+        if covered is not None:
+            mem = jnp.where((jnp.asarray(covered) > 0.5) & (labels == FREE), COVERED, mem)
+        return mem.astype(jnp.int8)
+
+    @staticmethod
+    def _known(state: EnvState) -> jax.Array:
+        """(N, H, W) bool: the cell is in robot i's map."""
+        return state.mem_state != UNKNOWN
+
+    @staticmethod
+    def _occupied(state: EnvState) -> jax.Array:
+        return state.mem_state == OCCUPIED
+
+    @staticmethod
+    def _free(state: EnvState) -> jax.Array:
+        """Seen free cells, covered or not."""
+        return state.mem_state >= FREE
+
+    @staticmethod
+    def _covered(state: EnvState) -> jax.Array:
+        return state.mem_state == COVERED
+
+    @staticmethod
+    def _uncovered(state: EnvState) -> jax.Array:
+        """Seen free cells not yet covered: the remaining work robot i knows of."""
+        return state.mem_state == FREE
+
     def _refresh_memory(self, state: EnvState, cover_mask: jax.Array) -> EnvState:
         """Scan, mark observed/covered cells, then exchange maps within comm range.
 
@@ -738,8 +796,8 @@ class MultiRobotCoverageEnv:
         lidar = self._cast_lidar_all(state)                          # (N, R)
 
         # Every sample strictly before the first hit is a seen cell, plus the
-        # cell just behind the hit point (the obstacle's own cell). Labels are
-        # static ground truth, so marking "known" is all the memory needs.
+        # cell just behind the hit point (the obstacle's own cell). A seen cell
+        # enters the map with its label: OCCUPIED for a wall cell, else FREE.
         dist = lidar * self.max_lidar_range
         ts = jnp.broadcast_to(self._ray_samples, (*dist.shape, self._ray_samples.shape[0]))
         ts = jnp.concatenate([ts, dist[..., None] + 1e-3], axis=-1)  # (N, R, K+1)
@@ -755,57 +813,26 @@ class MultiRobotCoverageEnv:
                  & (rows >= 0) & (rows < self.grid_h) & alive[:, None, None])
         flat = (jnp.clip(rows, 0, self.grid_h - 1) * self.grid_w
                 + jnp.clip(cols, 0, self.grid_w - 1)).reshape(n, -1)
-        known = state.mem_known.reshape(n, -1).at[ids[:, None], flat].max(
-            valid.reshape(n, -1).astype(jnp.float32)
-        )
+        label = self._cell_labels[state.map_id][flat]                  # (N, R*(K+1))
+        mem = state.mem_state.reshape(n, -1).at[ids[:, None], flat].max(
+            jnp.where(valid.reshape(n, -1), label, jnp.int8(UNKNOWN)))
 
         foot_c, foot_r, touch, _ = self._footprint_cells(pos)
         foot_flat = foot_r * self.grid_w + foot_c
         foot_cover = (cover_mask[:, None] & touch
                       & (self._free_flat[state.map_id, foot_flat] > 0.0))
-        covered = state.mem_covered.reshape(n, -1).at[ids[:, None], foot_flat].max(
-            foot_cover.astype(jnp.float32)
-        )
+        mem = mem.at[ids[:, None], foot_flat].max(
+            jnp.where(foot_cover, jnp.int8(COVERED), jnp.int8(UNKNOWN)))
 
-        # Thin walls can lie between two coverable cell centres. Remember
-        # blocked graph edges only where a lidar endpoint actually hit a wall.
-        hit_x = pos[:, None, 0] + dist * jnp.cos(angles)
-        hit_y = pos[:, None, 1] + dist * jnp.sin(angles)
-        walls = self.walls[state.map_id]
-        dx = hit_x[..., None] - jnp.clip(hit_x[..., None], walls[:, 0], walls[:, 2])
-        dy = hit_y[..., None] - jnp.clip(hit_y[..., None], walls[:, 1], walls[:, 3])
-        wall_dist = dx * dx + dy * dy
-        wall_id = jnp.argmin(wall_dist, axis=-1)
-        wall_hit = (jnp.min(wall_dist, axis=-1) < 1e-6) & (lidar < 1.) & alive[:, None]
-        hit_wall = walls[wall_id]
-        vertical = (hit_wall[..., 2] - hit_wall[..., 0]) < (hit_wall[..., 3] - hit_wall[..., 1])
-        edge_col = jnp.rint((hit_wall[..., 0] + hit_wall[..., 2]) * 0.5 / self.cell_size).astype(jnp.int32)
-        edge_row = jnp.rint((hit_wall[..., 1] + hit_wall[..., 3]) * 0.5 / self.cell_size).astype(jnp.int32)
-        hit_col = jnp.floor(hit_x / self.cell_size).astype(jnp.int32)
-        hit_row = jnp.floor(hit_y / self.cell_size).astype(jnp.int32)
-        blocked = state.mem_blocked
-        for side in (0, 1):
-            r = jnp.where(vertical, hit_row, edge_row - side)
-            c = jnp.where(vertical, edge_col - side, hit_col)
-            direction = jnp.where(vertical, 2 + side, side)
-            valid_edge = wall_hit & (r >= 0) & (r < self.grid_h) & (c >= 0) & (c < self.grid_w)
-            blocked = blocked.at[ids[:, None], jnp.clip(r, 0, self.grid_h - 1),
-                                 jnp.clip(c, 0, self.grid_w - 1), direction].max(valid_edge)
-
-        # Single-hop exchange: OR over direct neighbours (and self). Multi-hop
-        # spread still happens over successive steps.
+        # Single-hop exchange: cell-wise max over direct neighbours (and self),
+        # i.e. the union of their dictionaries. Multi-hop spread still happens
+        # over successive steps.
         in_range = self._pairwise_sq_dist(pos) < self.comm_radius ** 2
         adj = (in_range & alive[:, None] & alive[None, :]) | jnp.eye(n, dtype=bool)
-        adj = adj.astype(jnp.float32)
-        known = jnp.minimum(adj @ known, 1.0)
-        covered = jnp.minimum(adj @ covered, 1.0)
-        blocked = (adj @ blocked.reshape(n, -1).astype(jnp.float32)) > 0
+        mem = jnp.max(jnp.where(adj[:, :, None], mem[None], jnp.int8(UNKNOWN)), axis=1)
 
-        shape = (n, self.grid_h, self.grid_w)
         state = state.replace(
-            mem_known=known.reshape(shape),
-            mem_blocked=blocked.reshape((*shape, 4)),
-            mem_covered=covered.reshape(shape),
+            mem_state=mem.reshape(n, self.grid_h, self.grid_w),
             lidar=lidar,
         )
         return state
@@ -898,12 +925,8 @@ class MultiRobotCoverageEnv:
             # Evaluation is safe by default: humans always react to robots.
             # Training explicitly overrides this value with its curriculum.
             ghost_robot_prob = jnp.float32(0.0),
-            mem_known        = jnp.zeros(
-                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
-            ),
-            mem_blocked      = jnp.zeros((self.num_robots, self.grid_h, self.grid_w, 4), bool),
-            mem_covered      = jnp.zeros(
-                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
+            mem_state        = jnp.full(
+                (self.num_robots, self.grid_h, self.grid_w), UNKNOWN, jnp.int8
             ),
             lidar            = jnp.zeros((self.num_robots, self.n_rays), jnp.float32),
             last_discovery   = jnp.full((self.num_robots, 2), -1, jnp.int32),
@@ -922,7 +945,7 @@ class MultiRobotCoverageEnv:
             fallback_count  = jnp.zeros(self.num_robots, jnp.int32),
             fallback_stagnation = jnp.zeros(self.num_robots, jnp.int32),
             fallback_best_distance = jnp.full(self.num_robots, jnp.inf),
-            fallback_observed_edges = jnp.zeros(self.num_robots, jnp.int32),
+            fallback_observed_cells = jnp.zeros(self.num_robots, jnp.int32),
             fallback_sequence = jnp.zeros(self.num_robots, bool),
             fallback_commands = jnp.zeros((self.num_robots, self.fallback_sequence_steps, 2), jnp.float32),
             fallback_command_index = jnp.zeros(self.num_robots, jnp.int32),
@@ -998,10 +1021,14 @@ class MultiRobotCoverageEnv:
             # A non-ghost robot is a dynamic obstacle for a human.  Humans are
             # deliberately simple: they stop instead of planning a detour.
             # Sampling per human avoids making the whole crowd ghost at once.
+            # Only steps towards a nearby robot are refused: a human stopped
+            # next to a waiting robot could otherwise never walk away.
             diff_hr = h_cand_pos[:, None, :] - next_pos[None, :, :]
+            cand_d2 = jnp.sum(diff_hr * diff_hr, axis=-1)
+            curr_hr = state.human_positions[:, None, :] - next_pos[None, :, :]
             robot_near = jnp.any(
-                jnp.sum(diff_hr * diff_hr, axis=-1)
-                < self.human_robot_stop_distance ** 2,
+                (cand_d2 < self.human_robot_stop_distance ** 2)
+                & (cand_d2 < jnp.sum(curr_hr * curr_hr, axis=-1)),
                 axis=1,
             )
             robot_is_ghost = jax.random.uniform(
@@ -1187,11 +1214,13 @@ class MultiRobotCoverageEnv:
             fallback_used   = fallback_used,
             **control,
         )
-        # Recovery keeps control until its goal is covered, by this robot or a
-        # teammate; other cells discovered along the route do not release it.
-        # Standing on the goal also ends it in case the goal is not coverable.
-        goal_covered = new_grid.reshape(-1)[jnp.maximum(fallback_goal, 0)] > 0.5
-        reached = fallback_used & (goal_covered | (flat == fallback_goal))
+        # Recovery keeps control until this robot's own footprint covers its
+        # goal; a teammate covering it or cells discovered along the route do
+        # not release it (a goal known covered is replanned, not released).
+        # It also ends on an uncoverable goal or when no known uncovered cell
+        # is reachable any more (goal -1, so fallback_used is false).
+        own_cover = jnp.any(foot_cover & (foot_flat == fallback_goal[:, None]), axis=1)
+        reached = fallback_used & (own_cover | ((flat == fallback_goal) & ~coverable))
         continuing = fallback_used & ~reached & alive_next & ~terminated & ~truncated
         request = (self.fallback_enabled & ~state.fallback_active & alive_next
                    & ~terminated & ~truncated
@@ -1199,8 +1228,8 @@ class MultiRobotCoverageEnv:
                       | (no_progress_steps >= self.fallback_stall_steps)))
         # Include this step's own coverage before planning; shared memory is
         # refreshed once by step/VecEnv after physics (including auto-reset).
-        planning = next_state.replace(mem_covered=state.mem_covered.at[ids[:, None], foot_r, foot_c].max(
-            foot_cover.astype(jnp.float32)))
+        planning = next_state.replace(mem_state=state.mem_state.at[ids[:, None], foot_r, foot_c].max(
+            jnp.where(foot_cover, jnp.int8(COVERED), jnp.int8(UNKNOWN))))
         goals = self._recovery_goals(planning, request)
         activated = request & (goals >= 0)
         rewards -= self.fallback_cost * activated
@@ -1211,7 +1240,7 @@ class MultiRobotCoverageEnv:
             fallback_count=state.fallback_count + activated.astype(jnp.int32),
             fallback_stagnation=jnp.where(continuing, next_state.fallback_stagnation, 0),
             fallback_best_distance=jnp.where(continuing, next_state.fallback_best_distance, jnp.inf),
-            fallback_observed_edges=jnp.where(continuing, next_state.fallback_observed_edges, 0),
+            fallback_observed_cells=jnp.where(continuing, next_state.fallback_observed_cells, 0),
             fallback_sequence=continuing & next_state.fallback_sequence,
             fallback_commands=jnp.where(continuing[:, None, None], next_state.fallback_commands, 0.),
             fallback_command_index=jnp.where(continuing & ~collided, next_state.fallback_command_index, 0),
@@ -1227,15 +1256,15 @@ class MultiRobotCoverageEnv:
         cols, rows = self._pos_to_cell(state.robot_positions)
 
         def plan(i):
-            free = (state.mem_known[i] > 0.5) & (self.wall_grids[state.map_id] < 0.5)
-            targets = free & (state.mem_covered[i] < 0.5) & requested[i]
+            free = state.mem_state[i] >= FREE
+            targets = (state.mem_state[i] == FREE) & requested[i]
             return run_if(requested[i],
-                          lambda: astar(free, targets, rows[i] * self.grid_w + cols[i], state.mem_blocked[i])[0],
+                          lambda: astar(free, targets, rows[i] * self.grid_w + cols[i])[0],
                           jnp.int32(-1))
         return jax.lax.map(plan, self._robot_ids)
 
     def _recovery_actions(self, state, actions):
-        fields = ('fallback_stagnation', 'fallback_best_distance', 'fallback_observed_edges', 'fallback_sequence',
+        fields = ('fallback_stagnation', 'fallback_best_distance', 'fallback_observed_cells', 'fallback_sequence',
                   'fallback_commands', 'fallback_command_index', 'fallback_command_count',
                   'fallback_sequence_used', 'fallback_safety_override', 'fallback_rejection_flags')
         cols, rows = self._pos_to_cell(state.robot_positions)
@@ -1248,29 +1277,28 @@ class MultiRobotCoverageEnv:
             def recover():
                 pos, heading = state.robot_positions[i], state.robot_headings[i]
                 velocity, lidar = state.robot_velocities[i], state.lidar[i]
-                edges = state.mem_blocked[i]
                 start = rows[i] * self.grid_w + cols[i]
-                free = (state.mem_known[i] > 0.5) & (self.wall_grids[state.map_id] < 0.5)
-                all_targets = free & (state.mem_covered[i] < 0.5) & state.fallback_active[i]
+                free = state.mem_state[i] >= FREE
+                all_targets = (state.mem_state[i] == FREE) & state.fallback_active[i]
                 goal = state.fallback_goal[i]
                 keep = (goal >= 0) & all_targets.reshape(-1)[jnp.maximum(goal, 0)]
                 targets = jnp.where(keep, jnp.arange(self.num_cells).reshape(free.shape) == goal, all_targets)
-                planned = astar(free, targets, start, edges, return_path=True)
+                planned = astar(free, targets, start, return_path=True)
                 goal, waypoint, route, length = jax.lax.cond(
                     planned[0] < 0,
-                    lambda: astar(free, all_targets, start, edges, return_path=True),
+                    lambda: astar(free, all_targets, start, return_path=True),
                     lambda: planned)
                 point = (jnp.array([waypoint % self.grid_w, waypoint // self.grid_w]) + .5) * self.cell_size
                 distance = jnp.maximum(length - 2, 0) * self.cell_size + jnp.linalg.norm(pos - point)
                 changed = goal != state.fallback_goal[i]
-                edge_count = jnp.sum(edges.astype(jnp.int32))
-                improved = (changed | (edge_count != state.fallback_observed_edges[i])
+                cell_count = jnp.sum(state.mem_state[i] != UNKNOWN, dtype=jnp.int32)
+                improved = (changed | (cell_count != state.fallback_observed_cells[i])
                             | (distance < state.fallback_best_distance[i] - .02))
                 stagnation = jnp.where(improved, 0, state.fallback_stagnation[i] + 1)
                 best = jnp.where(improved, distance, state.fallback_best_distance[i])
                 sequence = ((state.fallback_sequence[i] & ~changed)
                             | (stagnation >= self.fallback_dwa_stall_steps)) & (goal >= 0)
-                dwa_action = dwa(self, pos, heading, velocity, lidar, free, point, edges)
+                dwa_action = dwa(self, pos, heading, velocity, lidar, free, point)
 
                 def execute_sequence():
                     def generate():
@@ -1278,7 +1306,7 @@ class MultiRobotCoverageEnv:
                         # storing moving people/robots as permanent walls.
                         local_free = local_route_free(self, free, pos, heading, lidar)
                         target = jnp.arange(self.num_cells).reshape(free.shape) == goal
-                        local = astar(local_free, target, start, edges, return_path=True)
+                        local = astar(local_free, target, start, return_path=True)
                         selected_route = jnp.where(local[0] >= 0, local[2], route)
                         selected_length = jnp.where(local[0] >= 0, local[3], length)
                         commands, count = velocity_sequence(
@@ -1292,7 +1320,7 @@ class MultiRobotCoverageEnv:
                                    state.fallback_command_count[i]))
                     command = commands[jnp.minimum(index, self.fallback_sequence_steps - 1)]
                     flags = jnp.where(index < count, command_safety_flags(
-                        self, pos, heading, command, lidar, free, edges), jnp.int32(16))
+                        self, pos, heading, command, lidar, free), jnp.int32(16))
                     safe = flags == 0
                     action = jnp.array([2 * command[0] / self.v_max - 1., command[1] / self.omega_max])
                     # DWA remains responsible for reactive avoidance. Any
@@ -1304,7 +1332,7 @@ class MultiRobotCoverageEnv:
                     sequence, execute_sequence,
                     (dwa_action, empty[4], jnp.int32(0), jnp.int32(0), jnp.bool_(False), jnp.bool_(False), jnp.int32(0)))
                 return (jnp.where(goal >= 0, action, actions[i]), goal, goal >= 0,
-                        stagnation, best, edge_count, sequence, commands, index, count, sequence_used, overridden, flags)
+                        stagnation, best, cell_count, sequence, commands, index, count, sequence_used, overridden, flags)
 
             default = (actions[i], jnp.int32(-1), jnp.bool_(False), *empty)
             if not self.fallback_enabled:
@@ -1355,8 +1383,8 @@ class MultiRobotCoverageEnv:
 
         The preferred direction is the reversal after a lane shift, otherwise
         the current sweep direction. The cell ahead of the last discovery is
-        open when the robot's own memory holds no wall cell, wall edge or
-        coverage there; unknown cells count as open.
+        open when the robot's own memory holds neither an occupied nor a
+        covered cell there; unknown cells count as open.
         """
         shifted = jnp.any(state.lane_return != 0, axis=-1)
         pref = jnp.where(shifted[:, None], state.lane_return, state.sweep_direction)
@@ -1367,17 +1395,9 @@ class MultiRobotCoverageEnv:
                   & (ahead[:, 1] >= 0) & (ahead[:, 1] < self.grid_h))
         c = jnp.clip(ahead[:, 0], 0, self.grid_w - 1)
         r = jnp.clip(ahead[:, 1], 0, self.grid_h - 1)
-        ids = self._robot_ids
         # Decentralised: only the robot's memory decides; an unseen wall is open.
-        wall = (state.mem_known[ids, r, c] > 0.5) & (self.wall_grids[state.map_id][r, c] > 0.5)
-        covered = state.mem_covered[ids, r, c] > 0.5
-        # Edge order S, N, W, E: row-1, row+1, col-1, col+1.
-        edge = jnp.where(pref[:, 1] < 0, 0, jnp.where(pref[:, 1] > 0, 1,
-                                                      jnp.where(pref[:, 0] < 0, 2, 3)))
-        last_c = jnp.clip(state.last_discovery[:, 0], 0, self.grid_w - 1)
-        last_r = jnp.clip(state.last_discovery[:, 1], 0, self.grid_h - 1)
-        edge_wall = state.mem_blocked[ids, last_r, last_c, edge]
-        open_ahead = has_pref & inside & ~wall & ~edge_wall & ~covered
+        cell = state.mem_state[self._robot_ids, r, c]
+        open_ahead = has_pref & inside & (cell != OCCUPIED) & (cell != COVERED)
         return pref, has_pref, ahead, open_ahead
 
     def _sweep_reward(self, state, disc_cell, discovered, visit, cell):
@@ -1406,15 +1426,13 @@ class MultiRobotCoverageEnv:
 
     def _known_work_field(self, state):
         """Routes through observed free cells only; covered frontiers allow exploration."""
-        known = state.mem_known > 0.5
-        free = known & (self.wall_grids[state.map_id][None] < 0.5)
+        free = self._free(state)
         # Outside the map is not an exploration frontier.
-        unknown = jnp.pad(~known, ((0, 0), (1, 1), (1, 1)), constant_values=False)
-        unknown_neighbors = jnp.stack([unknown[:, :-2, 1:-1], unknown[:, 2:, 1:-1],
-                                       unknown[:, 1:-1, :-2], unknown[:, 1:-1, 2:]], axis=-1)
-        frontier = free & jnp.any(unknown_neighbors & ~state.mem_blocked, axis=-1)
-        targets = jnp.stack([free & (state.mem_covered < 0.5), frontier])
-        fields = self._geodesic_distance(targets, jnp.broadcast_to(free, targets.shape), state.mem_blocked)
+        unknown = jnp.pad(~self._known(state), ((0, 0), (1, 1), (1, 1)), constant_values=False)
+        frontier = free & (unknown[:, :-2, 1:-1] | unknown[:, 2:, 1:-1]
+                           | unknown[:, 1:-1, :-2] | unknown[:, 1:-1, 2:])
+        targets = jnp.stack([self._uncovered(state), frontier])
+        fields = self._geodesic_distance(targets, jnp.broadcast_to(free, targets.shape))
         cols, rows = self._pos_to_cell(state.robot_positions)
         has_work = fields[0, self._robot_ids, rows, cols] < 0.5 * _FAR
         # A covered frontier must not distract the robot from reachable known work.
@@ -1546,7 +1564,7 @@ class MultiRobotCoverageEnv:
         discovered = num_new > 0.0
         free = self.free_masks[state.map_id] > 0.5                       # (H, W)
         if self.use_memory:
-            believed = state.mem_covered > 0.5                            # (N, H, W)
+            believed = self._covered(state)                               # (N, H, W)
         else:
             believed = jnp.broadcast_to(prev_grid > 0.5, (self.num_robots, *free.shape))
         targets = free[None] & ~believed
@@ -1555,9 +1573,8 @@ class MultiRobotCoverageEnv:
         else:
             dist = self._geodesic_distance(targets, jnp.broadcast_to(free, targets.shape))
 
-        blocked = state.mem_blocked if self.track_memory else None
-        before = self._work_distance(dist, state.robot_positions, blocked)
-        after = self._work_distance(dist, new_pos, blocked)
+        before = self._work_distance(dist, state.robot_positions)
+        after = self._work_distance(dist, new_pos)
         progress = jnp.where((before < 0.5 * _FAR) & (after < 0.5 * _FAR), before - after, 0.0)
 
         idle = jnp.clip(1.0 - progress / self._full_progress, 0.0, 1.0)
@@ -1691,10 +1708,13 @@ class MultiRobotCoverageEnv:
           lidar                                         n_rays, normalised
           occupied | covered | known                    3 x S x S memory crop,
                                                         grid-aligned, rows = +y ]
+        With crop_mode='directional' the crop is instead
+        obstacle | covered | robots, 3 x (S+2) x (S+2), see _directional_crops.
         With full memory enabled, five history values precede lidar: a valid
         flag and relative past-cell position (previous visit, or last discovery
-        for old checkpoints), followed by the historical sweep direction;
-        the five-channel personal map follows the crop. With sweep_obs, the
+        for old checkpoints), followed by the historical sweep direction.
+        Only with memory_map_obs (old checkpoints) the five-channel personal
+        map follows the crop. With sweep_obs, the
         preferred lane direction and whether its next cell is open follow them.
         Crop cells beyond the floor boundary are occupied=1, covered=0, known=1.
         With crop_summary the crop is 4 x (S+2) x (S+2): a ring averaging each
@@ -1742,15 +1762,15 @@ class MultiRobotCoverageEnv:
         parts.append(state.lidar)
 
         parts.append(self._actor_crops(state))
-        if self.use_full_memory:
+        if self.memory_map_obs:
             cols, rows = self._pos_to_cell(pos)
             own = jnp.zeros((n, self.grid_h, self.grid_w), jnp.float32)
             own = own.at[ids, rows, cols].set(alive.astype(jnp.float32))
             peers = jnp.einsum('ij,jhw->ihw', self._visible_teammates(state).astype(jnp.float32), own)
             maps = jnp.stack([
-                state.mem_known * self.wall_grids[state.map_id][None],
-                state.mem_covered, state.mem_known, own, jnp.minimum(peers, 1.0),
-            ], axis=1)
+                self._occupied(state), self._covered(state), self._known(state),
+                own, jnp.minimum(peers, 1.0),
+            ], axis=1).astype(jnp.float32)
             parts.append(maps.reshape(n, -1))
 
         return jnp.concatenate(parts, axis=1).astype(jnp.float32)
@@ -1816,16 +1836,16 @@ class MultiRobotCoverageEnv:
 
     def _known_coverage(self, state: EnvState) -> jax.Array:
         """(N,) covered fraction of the free cells robot i has in memory."""
-        known_free = state.mem_known * self.free_masks[state.map_id][None]
-        covered = jnp.sum(state.mem_covered * known_free, axis=(1, 2))
-        return covered / jnp.maximum(jnp.sum(known_free, axis=(1, 2)), 1.0)
+        known_free = jnp.sum(self._free(state), axis=(1, 2)).astype(jnp.float32)
+        covered = jnp.sum(self._covered(state), axis=(1, 2)).astype(jnp.float32)
+        return covered / jnp.maximum(known_free, 1.0)
 
     def _actor_crops(self, state: EnvState) -> jax.Array:
         """The local crop each actor observes, (N, crop_dim).
 
-        Decentralised: every value comes from the robot's own memory (lidar
-        marks cells known, driving over a cell marks it covered, and maps are
-        OR'd with teammates in comm range). A wall cell counts only once seen.
+        Decentralised: every value comes from the robot's belief map (lidar
+        adds seen cells as occupied or free, driving over a cell marks it
+        covered, and maps are merged with teammates in comm range).
         memory_comm: [occupied, covered, known], grid-aligned; cells beyond the
         floor are occupied=1, covered=0, known=1.
         legacy: max(covered, known wall) sampled in the heading-rotated frame;
@@ -1833,9 +1853,13 @@ class MultiRobotCoverageEnv:
         a known channel (1 beyond the floor), and both modes are wrapped in the
         summary ring of _add_crop_summary.
         """
+        if self.crop_mode == 'directional':
+            return self._directional_crops(state)
         n, ids = self.num_robots, self._robot_ids
         i = ids[:, None, None]
-        wall = self.wall_grids[state.map_id]
+        occupied_map = self._occupied(state).astype(jnp.float32)
+        covered_map = self._covered(state).astype(jnp.float32)
+        known_map = self._known(state).astype(jnp.float32)
         if self.use_memory:
             cols, rows = self._pos_to_cell(state.robot_positions)
             r = rows[:, None, None] + self._crop_offsets[None, :, None]  # (N, S, 1)
@@ -1843,14 +1867,12 @@ class MultiRobotCoverageEnv:
             inside = (r >= 0) & (r < self.grid_h) & (c >= 0) & (c < self.grid_w)
             r = jnp.clip(r, 0, self.grid_h - 1)
             c = jnp.clip(c, 0, self.grid_w - 1)
-            known = state.mem_known[i, r, c]
-            covered = jnp.where(inside, state.mem_covered[i, r, c], 0.0)
-            occupied = jnp.where(inside, known * wall[r, c], 1.0)
-            known = jnp.where(inside, known, 1.0)
+            occupied = jnp.where(inside, occupied_map[i, r, c], 1.0)
+            covered = jnp.where(inside, covered_map[i, r, c], 0.0)
+            known = jnp.where(inside, known_map[i, r, c], 1.0)
             crop = jnp.stack([occupied, covered, known], axis=1)     # (N, 3, S, S)
             if self.crop_summary:
-                sources = jnp.stack([state.mem_known * wall[None],
-                                     state.mem_covered, state.mem_known], axis=-1)
+                sources = jnp.stack([occupied_map, covered_map, known_map], axis=-1)
                 crop = self._add_crop_summary(state, crop, inside, sources, (1., 0., 1.))
             return crop.reshape(n, -1)
 
@@ -1867,15 +1889,73 @@ class MultiRobotCoverageEnv:
                   & (rows >= 0) & (rows < self.grid_h))
         cols = jnp.clip(cols, 0, self.grid_w - 1)
         rows = jnp.clip(rows, 0, self.grid_h - 1)
-        source = jnp.maximum(state.mem_covered, state.mem_known * wall[None])  # (N, H, W)
+        source = jnp.maximum(covered_map, occupied_map)                # (N, H, W)
         # Virtual cells beyond the floor use the same value as obstacles.
         patch = jnp.where(inside, source[i, rows, cols], 1.0)[:, None]  # (N, 1, S, S)
         if self.crop_summary:
-            known = jnp.where(inside, state.mem_known[i, rows, cols], 1.0)
+            known = jnp.where(inside, known_map[i, rows, cols], 1.0)
             patch = jnp.concatenate([patch, known[:, None]], axis=1)
-            sources = jnp.stack([source, state.mem_known], axis=-1)
+            sources = jnp.stack([source, known_map], axis=-1)
             patch = self._add_crop_summary(state, patch, inside, sources, (1., 1.))
         return patch.reshape(n, -1)
+
+    def _directional_crops(self, state: EnvState) -> jax.Array:
+        """[obstacle, covered, robots] S x S crop with a directional ring, (N, crop_dim).
+
+        Core S x S, robot in the centre cell, grid-aligned (row = +y), binary:
+          obstacle  a wall cell the robot has seen; 1 beyond the floor
+          covered   1 if covered in the robot's memory, else 0
+          robots    a teammate in communication range stands in the cell
+        Ring of thickness 1: each side holds, per channel, the mean of that
+        channel over the in-map cells beyond that side, so the obstacle ring
+        is the seen-wall fraction, the covered ring the covered fraction and
+        the robots ring the fraction of cells holding a teammate in comm
+        range. A cell outside the S x S core belongs to the side of its larger
+        offset (rows on ties). A side with no in-map cell takes the
+        beyond-the-floor values (obstacle 1, covered 0, robots 0). Corners
+        are 0. Everything comes from the robot's own memory, never the global
+        grid.
+        """
+        n, ids = self.num_robots, self._robot_ids
+        i = ids[:, None, None]
+        half, size = self.local_coverage_size // 2, self.local_coverage_size
+        cols, rows = self._pos_to_cell(state.robot_positions)
+        r = rows[:, None, None] + self._crop_offsets[None, :, None]      # (N, S, 1)
+        c = cols[:, None, None] + self._crop_offsets[None, None, :]      # (N, 1, S)
+        inside = (r >= 0) & (r < self.grid_h) & (c >= 0) & (c < self.grid_w)
+        r = jnp.clip(r, 0, self.grid_h - 1)
+        c = jnp.clip(c, 0, self.grid_w - 1)
+        # Full-grid channel maps from the robot's memory: (N, 3, H, W).
+        own = jnp.zeros((n, self.grid_h, self.grid_w), jnp.float32)
+        own = own.at[ids, rows, cols].set(state.robot_alive.astype(jnp.float32))
+        seen = self._visible_teammates(state).astype(jnp.float32)          # (N, N)
+        maps = jnp.stack([
+            self._occupied(state).astype(jnp.float32), self._covered(state).astype(jnp.float32),
+            jnp.minimum(jnp.einsum('nm,mhw->nhw', seen, own), 1.0),
+        ], axis=1)
+        core = jnp.where(inside[:, None], maps[i[:, None], jnp.arange(3)[None, :, None, None],
+                                                r[:, None], c[:, None]],
+                         jnp.array([1.0, 0.0, 0.0])[None, :, None, None])  # (N, 3, S, S)
+
+        # Per-channel mean beyond each side: (N, 4, 3) for -row, +row, -col, +col.
+        dr = jnp.arange(self.grid_h)[None, :, None] - rows[:, None, None]  # (N, H, 1)
+        dc = jnp.arange(self.grid_w)[None, None, :] - cols[:, None, None]  # (N, 1, W)
+        beyond = jnp.maximum(jnp.abs(dr), jnp.abs(dc)) > half
+        vertical = jnp.abs(dr) >= jnp.abs(dc)
+        sides = jnp.stack([vertical & (dr < 0), vertical & (dr > 0),
+                           ~vertical & (dc < 0), ~vertical & (dc > 0)], axis=1)
+        sides = (sides & beyond[:, None]).astype(jnp.float32)              # (N, 4, H, W)
+        count = jnp.sum(sides, axis=(2, 3))[..., None]                     # (N, 4, 1)
+        total = jnp.einsum('nshw,nchw->nsc', sides, maps)
+        mean = jnp.where(count > 0, total / jnp.maximum(count, 1.0), jnp.array([1.0, 0.0, 0.0]))
+
+        crop = jnp.zeros((n, 3, size + 2, size + 2), jnp.float32)
+        crop = crop.at[:, :, 0, 1:-1].set(mean[:, 0, :, None])
+        crop = crop.at[:, :, -1, 1:-1].set(mean[:, 1, :, None])
+        crop = crop.at[:, :, 1:-1, 0].set(mean[:, 2, :, None])
+        crop = crop.at[:, :, 1:-1, -1].set(mean[:, 3, :, None])
+        crop = crop.at[:, :, 1:-1, 1:-1].set(core)
+        return crop.reshape(n, -1)
 
     def get_global_state(self, state: EnvState) -> GlobalState:
         cols, rows = self._pos_to_cell(state.robot_positions)

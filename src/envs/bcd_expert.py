@@ -41,10 +41,11 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
 
+from .coverage_vector_env import COVERED
 from .recovery import command_safety_flags, dwa
 
 _FAR = 1_000_000   # geodesic distance between disconnected cells
-# Neighbour order matches mem_blocked: S (row-1), N (row+1), W (col-1), E (col+1).
+# Neighbour order matches recovery's blocked edges: S (row-1), N (row+1), W (col-1), E (col+1).
 _DR = np.array([-1, 1, 0, 0])
 _DC = np.array([0, 0, -1, 1])
 EXPERT_DEFAULTS = {
@@ -277,7 +278,7 @@ class BCDExpert:
         m = state.map_id
         n = env.num_robots
         cells, _, _ = self._cells(state)
-        known_covered = state.mem_covered.reshape(n, -1) > .5
+        known_covered = (state.mem_state == COVERED).reshape(n, -1)
         reach = self.dist[m][cells]                                         # (N, C)
         other = (self.free[m][None] & ~known_covered & (reach < _FAR)
                  & (jnp.arange(env.num_cells)[None] != cells[:, None]))
@@ -412,9 +413,8 @@ class BCDExpert:
         command = jnp.stack([v, omega], axis=-1)
 
         free = self.free[state.map_id].reshape(env.grid_h, env.grid_w)
-        # The planner's true wall edges: memory can hold phantom edges where a
-        # lidar ray hit the end face of a wall band.
-        edges = jnp.broadcast_to(~self.edges[state.map_id], state.mem_blocked.shape)
+        # The planner's true wall edges (the belief map holds no edges).
+        edges = jnp.broadcast_to(~self.edges[state.map_id], (env.num_robots, env.grid_h, env.grid_w, 4))
 
         def safe_command(pos, heading, velocity, lidar, cmd, goal, blocked):
             flags = command_safety_flags(env, pos, heading, cmd, lidar, free, blocked)

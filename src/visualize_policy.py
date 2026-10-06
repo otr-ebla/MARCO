@@ -496,12 +496,15 @@ def _load_checkpoint(
     if env_config is not None:
         env_config.update(ckpt.get("reward_weights", {}))
         env_config.update({"use_full_memory": False, "observation_stack": 1, "sweep_obs": False,
-                           "crop_summary": False, "critic_crops": False,
+                           "crop_summary": False, "crop_mode": "memory", "critic_crops": False,
                            "known_coverage_obs": False, "critic_coverage": False,
                            "goal_obs": False, "wall_cells": 0,
                            "history_cell": "last_discovery", "critic_context": False,
                            "critic_stack": 1})
-        env_config.update(ckpt.get("obs_config", {"obs_mode": "legacy"}))
+        obs_config = ckpt.get("obs_config", {"obs_mode": "legacy"})
+        env_config.update(obs_config)
+        # Checkpoints older than memory_map_obs read the full map with use_full_memory.
+        env_config["memory_map_obs"] = bool(obs_config.get("memory_map_obs", obs_config.get("use_full_memory", False)))
         env_config["actor_recurrent"] = bool(ckpt.get("actor_recurrent", False))
         env_config["actor_config"] = ckpt.get("actor_config", {})
 
@@ -615,6 +618,7 @@ def _policy_controller(args, env_cfg, model_cfg, train_cfg, device):
         tail_dim=env.patch_dim,
         memory_map_shape=env.memory_map_shape,
         observation_stack=env.observation_stack,
+        crop_shape=env.crop_shape,
         **actor_cfg,
     )
 

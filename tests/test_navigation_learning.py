@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.envs.coverage_vector_env import MultiRobotCoverageEnv, _FAR
+from src.envs.coverage_vector_env import OCCUPIED, MultiRobotCoverageEnv, _FAR
 from src.envs.map_layouts import create_map_bank
 from src.envs.vec_env import VecEnv
 from src.algorithms.mappo import MAPPO, compute_gae, recovery_imitation_loss
@@ -53,24 +53,26 @@ class NavigationTests(unittest.TestCase):
 
     def test_wall_memory_and_physics_agree(self):
         env, state = self.env, self.state
-        self.assertGreater(float((state.mem_known[0] * env.wall_grids[0]).sum()), 0.)
+        # Seen walls are stored as occupied cells, and only real wall cells are.
+        occupied = np.asarray(state.mem_state[0] == OCCUPIED)
+        self.assertGreater(occupied.sum(), 0)
+        np.testing.assert_array_equal(np.asarray(env.wall_grids[0])[occupied], 1.)
         rows, cols = np.nonzero(np.asarray(env.wall_grids[0]))
         points = (jnp.array(np.stack([cols, rows], -1)) + .5) * env.cell_size
         np.testing.assert_array_equal(env._wall_collision(points, jnp.int32(0)), True)
 
-    def test_blocked_edges_require_a_detour_and_cannot_be_interpolated_through(self):
+    def test_occupied_cells_require_a_detour(self):
         env = self.env
-        free = jnp.zeros((1, env.grid_h, env.grid_w), bool).at[:, 2:5, 2:5].set(True)
+        # A 3x3 free block whose centre (row 3, col 3) is an occupied cell.
+        free = jnp.zeros((1, env.grid_h, env.grid_w), bool).at[:, 2:5, 2:5].set(True).at[:, 3, 3].set(False)
         targets = jnp.zeros_like(free).at[:, 3, 4].set(True)
-        edges = jnp.zeros((*free.shape, 4), bool).at[:, 3, 3, 3].set(True).at[:, 3, 4, 2].set(True)
-        field = env._geodesic_distance(targets, free, edges)
-        self.assertEqual(float(field[0, 3, 3]), 3.)
-        distance = env._work_distance(field, jnp.array([[1.75, 1.75]]), edges)
-        np.testing.assert_allclose(distance, 3.)
-        # Sealing the entire boundary makes work unreachable.
-        edges = edges.at[:, :, 3, 3].set(True).at[:, :, 4, 2].set(True)
-        field = env._geodesic_distance(targets, free, edges)
-        self.assertGreaterEqual(float(field[0, 3, 3]), _FAR)
+        field = env._geodesic_distance(targets, free)
+        self.assertEqual(float(field[0, 3, 2]), 4.)
+        distance = env._work_distance(field, jnp.array([[1.25, 1.75]]))
+        np.testing.assert_allclose(distance, 4.)
+        # Occupying the whole middle column makes the work unreachable.
+        field = env._geodesic_distance(targets, free.at[:, 2:5, 3].set(False))
+        self.assertGreaterEqual(float(field[0, 3, 2]), _FAR)
 
     def test_revisit_cost_decays_with_time_or_coverage(self):
         env, state = self.env, self.state
@@ -229,6 +231,19 @@ class CheckpointHistoryTests(unittest.TestCase):
                 self.assertEqual(config['wall_cells'], expected_walls)
                 self.assertEqual(config['critic_stack'], expected_stack)
                 self.assertFalse(config['goal_obs'])
+
+    def test_visualizer_keeps_the_map_only_for_checkpoints_trained_with_it(self):
+        from src.visualize_policy import _load_checkpoint
+        for metadata, expected in (
+            ({'obs_mode': 'memory_comm', 'use_full_memory': True}, True),   # before memory_map_obs
+            ({'obs_mode': 'memory_comm', 'use_full_memory': True, 'memory_map_obs': False}, False),
+        ):
+            with self.subTest(expected=expected), tempfile.NamedTemporaryFile(suffix='.pkl') as file:
+                pickle.dump({'actor_params': {}, 'obs_config': metadata}, file)
+                file.flush()
+                config = dict(CONFIG)
+                _load_checkpoint(file.name, jax.devices('cpu')[0], config)
+                self.assertEqual(config['memory_map_obs'], expected)
 
 
 if __name__ == '__main__':

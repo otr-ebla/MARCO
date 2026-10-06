@@ -486,7 +486,7 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
         template['memory'] = jax.ShapeDtypeStruct((T, E * env.num_robots, actor.hidden_size),
                                                   jnp.float32)
     buffer = ReplayBuffer(int(pcfg['replay_rollouts']), template, vec_env.norm_dim,
-                          binary_tail=not env.crop_summary, sequence_length=sequence_length)
+                          binary_tail=env.crop_binary, sequence_length=sequence_length)
     regress, fresh_loss = make_regress(actor, tx, int(pcfg['grad_steps']),
                                        int(pcfg['minibatch_size']), float(pcfg['decision_threshold']),
                                        buffer.observations, (T, E, env.num_robots), sequence_length)

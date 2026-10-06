@@ -62,13 +62,17 @@ def _conv(features: int, kernel, strides, padding, gain: float = _RELU_GAIN) -> 
 
 def _local_features(obs: jax.Array, vec_dim: int, n_rays: int, tail_dim: int,
                     lidar_embed: int, memory_map_shape: tuple = (),
-                    observation_stack: int = 1, encode_maps: bool = True) -> jax.Array:
+                    observation_stack: int = 1, encode_maps: bool = True,
+                    crop_shape: tuple = (), crop_encoder: str = 'flat') -> jax.Array:
     """Shared local encoder: [vec | lidar | tail] -> [lidar embedding, vec, tail].
 
     Called from inside a compact module, so the layers it creates belong to
     the caller (names Conv_0, Conv_1, Dense_0 are unchanged for the actor).
     With encode_maps=False the personal maps are dropped from every frame;
     the caller reads the latest one itself (see latest_memory_map).
+    With crop_encoder='cnn' the local crop at the start of the tail, (C, S, S)
+    with one channel per map layer (occupied, covered, known, ...), is read
+    by a 2D CNN instead of being passed on flat ('flat', older checkpoints).
     """
     batch = obs.shape[0]
     if observation_stack > 1:
@@ -87,6 +91,17 @@ def _local_features(obs: jax.Array, vec_dim: int, n_rays: int, tail_dim: int,
     x = nn.relu(_conv(16, (5,), (2,), 'CIRCULAR')(x))
     x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
     x = nn.relu(_dense(lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
+    if crop_encoder == 'cnn' and crop_shape:
+        # Full resolution: on a 5x5 crop a stride would merge the cell under
+        # the robot with its neighbours.
+        crop_dim = math.prod(crop_shape)
+        crop = jnp.transpose(tail[:, :crop_dim].reshape(-1, *crop_shape), (0, 2, 3, 1))
+        crop = nn.relu(_conv(16, (3, 3), (1, 1), 'SAME')(crop))
+        crop = nn.relu(_conv(32, (3, 3), (1, 1), 'SAME')(crop))
+        crop = nn.relu(_dense(64, _RELU_GAIN)(crop.reshape(crop.shape[0], -1)))
+        tail = jnp.concatenate([crop, tail[:, crop_dim:]], axis=-1)
+    elif crop_encoder != 'flat':
+        raise ValueError(f'Unknown crop_encoder: {crop_encoder}')
     if memory_map_shape and not encode_maps:
         tail = tail[:, :-math.prod(memory_map_shape)]
     elif memory_map_shape:
@@ -214,6 +229,8 @@ class Actor(nn.Module):
     observation_stack: int = 1
     log_std_min: float = _LOG_STD_MIN
     log_std_max: float = _LOG_STD_MAX
+    crop_shape: tuple = ()          # (C, S, S) local crop, read by crop_encoder
+    crop_encoder: str = 'flat'      # 'cnn' or 'flat' (older checkpoints)
     map_encoder: str = 'cnn'        # 'cnn' (legacy) or 'spatial_memory'
     map_embed: int = 256            # spatial_memory: global read width
     attention_heads: int = 4        # spatial_memory: context read heads
@@ -232,7 +249,8 @@ class Actor(nn.Module):
                 raise ValueError("map_encoder='spatial_memory' needs env.use_full_memory")
             h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
                                 self.lidar_embed, self.memory_map_shape,
-                                self.observation_stack, encode_maps=False)
+                                self.observation_stack, encode_maps=False,
+                                crop_shape=self.crop_shape, crop_encoder=self.crop_encoder)
             maps = latest_memory_map(obs, self.vec_dim, self.n_rays, self.tail_dim,
                                      self.memory_map_shape, self.observation_stack)
             read = SpatialMemoryRead(self.map_embed, self.attention_heads,
@@ -240,7 +258,8 @@ class Actor(nn.Module):
             h = jnp.concatenate([h, read], axis=-1)
         elif self.map_encoder == 'cnn':
             h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
-                                self.lidar_embed, self.memory_map_shape, self.observation_stack)
+                                self.lidar_embed, self.memory_map_shape, self.observation_stack,
+                                crop_shape=self.crop_shape, crop_encoder=self.crop_encoder)
         else:
             raise ValueError(f'Unknown map_encoder: {self.map_encoder}')
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
@@ -309,12 +328,15 @@ class LocalCritic(nn.Module):
     hidden_size: int = 256
     memory_map_shape: tuple = ()
     observation_stack: int = 1
+    crop_shape: tuple = ()
+    crop_encoder: str = 'flat'
 
     @nn.compact
     def __call__(self, obs: jax.Array) -> jax.Array:
         """obs : (B, obs_dim) -> value : (B, 1)"""
         h = _local_features(obs, self.vec_dim, self.n_rays, self.tail_dim,
-                            self.lidar_embed, self.memory_map_shape, self.observation_stack)
+                            self.lidar_embed, self.memory_map_shape, self.observation_stack,
+                            crop_shape=self.crop_shape, crop_encoder=self.crop_encoder)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         return _dense(1, 1.0)(h)
