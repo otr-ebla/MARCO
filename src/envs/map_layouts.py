@@ -12,7 +12,8 @@ class ProceduralMapLayout:
     """
     def __init__(self, width=12.0, height=8.0, min_room_size=2.0, max_walls=30,
                  cell_size: float = 0.5, robot_radius: float = 0.20,
-                 rng: random.Random | None = None, wall_cells: int = 1):
+                 rng: random.Random | None = None, wall_cells: int = 1,
+                 max_depth: int = 3):
         self.width = width
         self.height = height
         self.min_room_size = min_room_size
@@ -20,6 +21,10 @@ class ProceduralMapLayout:
         self.cell_size = cell_size
         self.robot_radius = robot_radius
         self._rng = rng if rng is not None else random.Random()
+        # BSP recursion depth: at most 2 ** max_depth rooms (0 = one empty room).
+        self.max_depth = int(max_depth)
+        if self.max_depth < 0 or self.max_depth != max_depth:
+            raise ValueError('max_depth must be a non-negative integer')
         self.wall_cells = int(wall_cells)
         if self.wall_cells < 0 or self.wall_cells != wall_cells:
             raise ValueError('wall_cells must be a non-negative integer (0 is legacy geometry)')
@@ -48,7 +53,8 @@ class ProceduralMapLayout:
             self._split_grid(0, 0, int(self.width / self.cell_size),
                              int(self.height / self.cell_size), 0, set())
         else:
-            self._split_space(0.0, 0.0, self.width, self.height, depth=0, max_depth=3)
+            self._split_space(0.0, 0.0, self.width, self.height, depth=0,
+                             max_depth=self.max_depth)
 
     def _split_grid(self, x, y, w, h, depth, protected):
         """BSP with whole-cell wall bands and protected doorway approaches.
@@ -56,7 +62,7 @@ class ProceduralMapLayout:
         Child rooms exclude the wall band. Keeping the cells immediately on
         either side of every door free prevents later splits sealing a door.
         """
-        if depth >= 3:
+        if depth >= self.max_depth:
             return
         horizontal = w < h
         if max(w, h) < 1.2 * min(w, h):

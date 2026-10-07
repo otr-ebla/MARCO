@@ -1,0 +1,156 @@
+# Single-robot coverage: the simplified problem used to compare learned
+# policies against Boustrophedon Cellular Decomposition (BCD).
+#
+# One robot, a smaller room (8 m x 6 m, at most four BSP rooms), the same
+# local observation as the multi-robot memory actor (pose, velocity, previous
+# visited cell, 70-ray lidar, 7x7 directional crop of its own belief map)
+# without the communication slots. The global map is never an actor input.
+#
+# Four policies are compared (see docs/single_robot.md):
+#   RL      python -m src.train_marl  --config config/single_robot.yaml \
+#               --policy-mode end-to-end-memory --save-dir checkpoints/single/rl
+#   IL      python -m src.pretrain_bc --config config/single_robot.yaml \
+#               --policy-mode end-to-end-memory --save-dir checkpoints/single/il
+#           (checkpoint_bc_actor.pkl is the imitation-only policy)
+#   IL+RL   python -m src.train_marl  --config config/single_robot.yaml \
+#               --policy-mode end-to-end-memory --bc-coef 0.5 \
+#               --resume checkpoints/single/il/checkpoint_bc.pkl \
+#               --save-dir checkpoints/single/il_rl
+#   BCD     python -m src.evaluate_policies --config config/single_robot.yaml \
+#               --bcd tour ...   (centralised: full map known in advance)
+env:
+  num_robots: 1
+  num_maps: 64
+  map_seed: 0
+  map_width: 8.0               # metres -> 16 x 12 cells
+  map_height: 6.0
+  map_depth: 2                 # BSP depth: up to four rooms joined by doorways
+  num_humans: 0
+  n_rays: 70
+  max_lidar_range: 5.0
+  cell_size: 0.5
+  wall_cells: 1                # grid-aligned wall bands, at least one occupied cell
+  sensing_radius: 5.0
+  robot_radius: 0.20
+  coverage_overlap: 0.8          # a neighbour cell is covered once the disk enters it by 80% of its radius
+  dt: 0.1
+  max_steps: 4000             # BCD needs ~2100 steps; margin for learned policies
+  v_max: 1.0
+  omega_max: 1.0
+  terminate_on_collision: false
+  obs_mode: memory_comm        # personal lidar-built map; with one robot nothing is merged
+  history_cell: previous_visit # past cell only; the actor selects its own next destination
+  critic_context: true         # reward/control history is privileged critic input
+  fallback_enabled: true
+  fallback_revisit_threshold: 7  # consecutive covered-cell entries
+  fallback_stall_steps: 70       # no discovery, including stopping/spinning
+  fallback_linear_accel: 1.0     # m/s², local DWA velocity window
+  fallback_angular_accel: 2.0    # rad/s²
+  fallback_dwa_steps: 12         # prediction horizon in physics steps
+  fallback_dwa_stall_steps: 30   # switch to a velocity sequence after stalled DWA
+  fallback_sequence_steps: 64   # command buffer; replenished along the A* route
+  fallback_sequence_speed: 0.4  # m/s; each command is guarded by current lidar
+  comm_radius: 0.0
+  comm_slots: 0                # no teammates: no communication slots in the observation
+  local_coverage_size: 5
+  crop_mode: directional       # 7x7: [obstacle, covered, robots] + ring of per-channel means beyond each side
+  use_full_memory: true
+  observation_stack: 1         # the GRU carries short-term history instead of a frame stack
+  critic_stack: 5              # ordered global frames with the robot's visit counts
+
+model:
+  hidden_size: 256             # trunk width and GRU state
+  lidar_embed: 64
+  crop_encoder: cnn
+  critic_hidden: 256
+  critic_map_embed: 128
+  log_std_min: -2.3
+  log_std_max: 1.0
+
+train:
+  num_envs: 64
+  rollout_steps: 128
+  total_updates: 2000
+  log_interval: 10
+  save_interval: 100
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_actor: 1.0e-4
+  lr_critic: 1.0e-3
+  lr_decay: true
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  recovery_imitation_coef: 0.5
+  target_kl: 0.02
+  max_grad_norm: 10.0
+  reward_scale: 0.05
+  huber_delta: 1.0
+  n_epochs: 4
+  num_minibatches: 8
+  normalize_obs: true
+  # Behaviour cloning towards the BCD expert during RL, decaying linearly to 0.
+  # 0 for pure RL; the IL+RL run sets it with --bc-coef.
+  bc_coef: 0.0
+  bc_decay_updates: 300
+
+# src.pretrain_bc: DAgger behaviour cloning of the actor, then critic warm-up.
+pretrain:
+  num_envs: 64
+  bc_iterations: 300
+  rollout_steps: 128
+  beta_decay_iterations: 150
+  replay_rollouts: 32
+  grad_steps: 48
+  minibatch_size: 1024
+  lr: 3.0e-4
+  decision_weight: 2.0
+  decision_threshold: 0.2
+  eval_interval: 25
+  eval_envs: 16
+  critic_warmup_updates: 100
+  local_labels: true          # imitate only decisions whose target is inside the actor crop
+  rl_init_std: 0.3
+  sequence_length: 32
+  expert:
+    v_cruise: 0.8
+    k_omega: 2.0
+    heading_power: 3.0
+    stop_margin: 0.05
+    clearance_ramp: 0.4
+    lookahead: 0.3
+    yield_radius: 0.9
+    # Teacher = the BCD plan itself (first uncovered cell of the offline tour).
+    # 'local' (nearest uncovered cell) stalls at ~45% coverage with one robot.
+    # With local_labels only steps whose target lies in the actor crop are imitated.
+    target_rule: tour
+
+wandb:
+  enabled: true
+  project: mrcpp-single
+  mode: online
+
+e2e_num_maps: 64
+# Same reward as the multi-robot memory actor without the teammate terms.
+e2e_reward:
+  reward_mode: sequential
+  alpha: 10.0
+  coverage_reward_growth: 2.0
+  sequential_bonus: 6.0
+  straight_bonus: 4.0
+  boustrophedon_bonus: 8.0
+  revisit_cost: 6.0
+  revisit_end_fraction: 0.025
+  revisit_decay_power: 2.0
+  revisit_streak_cap: 3
+  fallback_cost: 10.0
+  axis_alignment_cost: 0.5
+  progress_weight: 2.0
+  loiter_cost: 0.2
+  spread_weight: 0.0           # no teammates
+  los_spread_weight: 0.0
+  tau: 0.02
+  wall_kappa: 2.0
+  kappa: 5.0
+  human_kappa: 10.0
+  completion_bonus: 200.0
+  completion_time_bonus: 1.0

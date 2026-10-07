@@ -95,6 +95,24 @@ each rollout chunk.
 
 ---
 
+## 🤖 Single-robot baseline study
+
+A simplified problem with **one robot** in smaller rooms (8 m × 6 m, up to four
+rooms), the same local observation without communication, and the same coverage
+objective. It compares four methods on identical seeds and unseen layouts:
+centralised **BCD** (Boustrophedon Cellular Decomposition, map known in advance),
+**IL** (DAgger imitation of BCD), **RL** (PPO from scratch) and **IL+RL**
+(imitation, then PPO with a decaying BC term).
+
+```bash
+bash scripts/single_robot_experiments.sh --backend cuda
+```
+
+Configuration in `config/single_robot.yaml`; details, individual commands and
+reference BCD numbers in [`docs/single_robot.md`](docs/single_robot.md).
+
+---
+
 ## 🚀 Getting Started
 
 Clone the repository and install dependencies:

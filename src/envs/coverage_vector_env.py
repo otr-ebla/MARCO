@@ -363,8 +363,16 @@ class MultiRobotCoverageEnv:
 
         # -- Map Bank Precomputation --
         self.num_maps = int(cfg.get('num_maps', 16))
+        # Room extent in metres and BSP depth (at most 2 ** map_depth rooms).
+        self.map_width = float(cfg.get('map_width', 12.0))
+        self.map_height = float(cfg.get('map_height', 8.0))
+        self.map_depth = int(cfg.get('map_depth', 3))
+        if min(self.map_width, self.map_height) <= 0 or self.map_depth < 0:
+            raise ValueError('map_width/map_height must be positive and map_depth non-negative')
         layouts = create_map_bank(self.num_maps,
                                    seed=int(cfg.get('map_seed', 0)),
+                                   width=self.map_width, height=self.map_height,
+                                   max_depth=self.map_depth,
                                    cell_size=self.cell_size,
                                    robot_radius=self.robot_radius, wall_cells=self.wall_cells)
         

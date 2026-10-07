@@ -2,6 +2,11 @@
 """Benchmark trained MARL coverage policies and save result data.
 
     python -m src.evaluate_policies --checkpoint checkpoints/e2e/checkpoint_e2e.pkl
+    python -m src.evaluate_policies --config config/single_robot.yaml --bcd tour \
+        --checkpoint checkpoints/single/rl/checkpoint_e2e_memory.pkl --label RL
+
+`--bcd tour` adds classical centralised Boustrophedon Cellular Decomposition
+(planned on the known map) as a baseline, run on the same seeds and maps.
 
 Each checkpoint is evaluated for `--episodes` episodes in compiled accelerator
 batches. Raw episode data, aggregate statistics and run metadata are written to
@@ -60,16 +65,47 @@ FIELDS = [
 class PolicySpec:
     name: str
     humans: int
-    checkpoint: Path
+    checkpoint: Path | None = None
+    bcd_rule: str | None = None   # BCD expert instead of a checkpoint: 'tour' or 'local'
 
 
-def _env_config(path: Path, humans: int, max_steps: int | None) -> tuple[dict, dict]:
+def _env_config(path: Path, humans: int, max_steps: int | None,
+                maps: int | None = None, map_seed: int | None = None) -> tuple[dict, dict]:
     config = load_config(str(path))
     env_cfg = dict(config.get("env", {}))
     env_cfg["num_humans"] = humans
     if max_steps is not None:
         env_cfg["max_steps"] = max_steps
+    if maps is not None:
+        env_cfg["num_maps"] = maps
+    if map_seed is not None:
+        env_cfg["map_seed"] = map_seed
     return config, env_cfg
+
+
+def _bcd_policy(spec: PolicySpec, config: dict, env_cfg: dict, batch: int):
+    """BCD expert on the evaluation environment: (vec_env, act, init_extra).
+
+    'tour' is classical centralised BCD: the decomposition and the tour are
+    planned offline on the true map and the robot follows the first cell of
+    the tour it has not covered. 'local' is the memory-driven variant (nearest
+    uncovered cell). The expert has its own safety filter, so the recovery
+    fallback is off.
+    """
+    from src.envs.bcd_expert import BCDExpert
+    from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
+    env_cfg.update({**E2E_REWARD_DEFAULTS, **config.get("e2e_reward", {})})
+    env_cfg["fallback_enabled"] = False
+    vec_env = VecEnv(batch, env_cfg)
+    expert_cfg = {**config.get("pretrain", {}).get("expert", {}), "target_rule": spec.bcd_rule}
+    expert = BCDExpert(vec_env.env, expert_cfg)
+    act = jax.vmap(expert.act)
+
+    def policy(state, obs, chunk, key):
+        actions, chunk, _ = act(state, chunk)
+        return actions, chunk
+
+    return vec_env, policy, expert.init_chunks((vec_env.E,))
 
 
 def _empty_accumulators(n: int) -> dict[str, np.ndarray]:
@@ -112,13 +148,11 @@ def _record(name: str, episode: int, seed: int, humans: int, steps: int,
     }
 
 
-def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
-                  max_steps: int | None, batch_size: int, chunk_steps: int,
-                  stochastic: bool, device, progress_every: int,
-                  policy_only: bool = False, recovery_trace: Path | None = None) -> list[dict]:
+def _checkpoint_policy(spec: PolicySpec, config: dict, env_cfg: dict, batch: int,
+                       stochastic: bool, device, policy_only: bool):
+    """Trained actor from a checkpoint: (vec_env, act, init_extra)."""
     if not spec.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {spec.checkpoint}")
-    config, env_cfg = _env_config(config_path, spec.humans, max_steps)
     with spec.checkpoint.open("rb") as handle:
         checkpoint = pickle.load(handle)
     recurrent = checkpoint.get("actor_recurrent", False)
@@ -135,7 +169,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     env_cfg["memory_map_obs"] = bool(obs_config.get("memory_map_obs", obs_config.get("use_full_memory", False)))
     if policy_only:
         env_cfg['fallback_enabled'] = False
-    vec_env = VecEnv(min(batch_size, episodes), env_cfg)
+    vec_env = VecEnv(batch, env_cfg)
     env = vec_env.env
     model_cfg = config.get("model", {})
     actor_cfg = {"lidar_embed": model_cfg.get("lidar_embed", 64),
@@ -147,25 +181,46 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                   observation_stack=env.observation_stack, **actor_cfg)
     params = jax.device_put(checkpoint["actor_params"], device)
     rms = RunningMeanStd(*jax.device_put(tuple(checkpoint["obs_rms"]), device))
-    state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
+
+    def policy(state, obs, memory, action_key):
+        normalized = rms_normalize(rms, obs)
+        if recurrent:
+            mean, log_std, memory = actor.apply(
+                params, normalized.reshape(-1, env.obs_dim), memory)
+        else:
+            mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
+        if stochastic:
+            z = mean + jnp.exp(log_std) * jax.random.normal(action_key, mean.shape)
+            actions = jnp.tanh(z)
+        else:
+            actions = jnp.tanh(mean)
+        return actions.reshape(vec_env.E, env.num_robots, env.action_dim), memory
 
     memory = jnp.zeros((vec_env.E * env.num_robots, actor.hidden_size)) if recurrent else None
+    return vec_env, policy, memory
+
+
+def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
+                  max_steps: int | None, batch_size: int, chunk_steps: int,
+                  stochastic: bool, device, progress_every: int,
+                  policy_only: bool = False, recovery_trace: Path | None = None,
+                  maps: int | None = None, map_seed: int | None = None) -> list[dict]:
+    config, env_cfg = _env_config(config_path, spec.humans, max_steps, maps, map_seed)
+    batch = min(batch_size, episodes)
+    if spec.bcd_rule is not None:
+        vec_env, policy, extra = _bcd_policy(spec, config, env_cfg, batch)
+        recurrent = False
+    else:
+        vec_env, policy, extra = _checkpoint_policy(
+            spec, config, env_cfg, batch, stochastic, device, policy_only)
+        recurrent = extra is not None
+    env = vec_env.env
+    state, obs, _, _ = vec_env.reset(jax.random.PRNGKey(seed))
 
     def run_chunk(carry, keys):
         def one(c, action_key):
-            state, obs, memory = c
-            normalized = rms_normalize(rms, obs)
-            if recurrent:
-                mean, log_std, memory = actor.apply(
-                    params, normalized.reshape(-1, env.obs_dim), memory)
-            else:
-                mean, log_std = actor.apply(params, normalized.reshape(-1, env.obs_dim))
-            if stochastic:
-                z = mean + jnp.exp(log_std) * jax.random.normal(action_key, mean.shape)
-                actions = jnp.tanh(z)
-            else:
-                actions = jnp.tanh(mean)
-            actions = actions.reshape(vec_env.E, env.num_robots, env.action_dim)
+            state, obs, extra = c
+            actions, extra = policy(state, obs, extra, action_key)
             next_state, next_obs, rewards, term, done, info, _ = vec_env.step(state, actions)
             previous_col = jnp.clip(
                 (state.robot_positions[..., 0] / env.cell_size).astype(jnp.int32),
@@ -210,8 +265,8 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                       info["human_collision_rate"], jnp.sum(revisited, axis=-1),
                       jnp.sum(entered, axis=-1), control, trace)
             if recurrent:
-                memory = jnp.where(jnp.repeat(done, env.num_robots)[:, None], 0., memory)
-            return (next_state, next_obs, memory), output
+                extra = jnp.where(jnp.repeat(done, env.num_robots)[:, None], 0., extra)
+            return (next_state, next_obs, extra), output
         return jax.lax.scan(one, carry, keys)
 
     run_chunk = jax.jit(run_chunk)
@@ -226,7 +281,7 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
     while len(rows) < episodes:
         key, chunk_key = jax.random.split(key)
         keys = jax.random.split(chunk_key, chunk_steps)
-        (state, obs, memory), outputs = run_chunk((state, obs, memory), keys)
+        (state, obs, extra), outputs = run_chunk((state, obs, extra), keys)
         arrays = jax.device_get(outputs)
         (rewards, dones, terms, coverage, covered, complete, timeout, walls,
          robots, humans, revisits, entries, control, trace) = arrays
@@ -426,10 +481,18 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", type=int, default=1000)
-    parser.add_argument("--checkpoint", type=Path, action="append", required=True,
+    parser.add_argument("--checkpoint", type=Path, action="append", default=[],
                         help="policy checkpoint to evaluate; repeat to compare several")
     parser.add_argument("--label", action="append", default=None,
                         help="display name per --checkpoint (default: parent/file name)")
+    parser.add_argument("--bcd", choices=("tour", "local"), action="append", default=[],
+                        help="also evaluate the BCD expert: 'tour' = centralised BCD planned "
+                             "on the known map, 'local' = nearest uncovered cell in memory")
+    parser.add_argument("--maps", type=int, default=None,
+                        help="evaluation map-bank size (overrides env.num_maps)")
+    parser.add_argument("--map-seed", type=int, default=None,
+                        help="evaluation map-bank seed (overrides env.map_seed); a seed "
+                             "other than the training one gives unseen layouts")
     parser.add_argument("--humans", type=int, default=8,
                         help="humans during evaluation (default: 8)")
     parser.add_argument("--seed", type=int, default=0)
@@ -454,11 +517,15 @@ def main() -> None:
         raise SystemExit("episodes, batch-size and chunk-steps must be positive; humans cannot be negative")
     device = select_device(None if args.backend == "auto" else args.backend)
     print(f"Device: {describe(device)}")
+    if not args.checkpoint and not args.bcd:
+        raise SystemExit("Give at least one --checkpoint or --bcd")
     labels = args.label or [f"{c.parent.name}/{c.name}" for c in args.checkpoint]
     if len(labels) != len(args.checkpoint):
         raise SystemExit("Give one --label per --checkpoint, or none")
     specs = [PolicySpec(label, args.humans, path)
              for label, path in zip(labels, args.checkpoint)]
+    specs += [PolicySpec(f"BCD ({rule})", args.humans, bcd_rule=rule)
+              for rule in dict.fromkeys(args.bcd)]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.recovery_trace is not None:
         args.recovery_trace.parent.mkdir(parents=True, exist_ok=True)
@@ -466,13 +533,18 @@ def main() -> None:
     started = time.time()
     rows = []
     for spec in specs:
-        for policy_only in ([False, True] if args.compare_policy_only else [args.policy_only]):
-            named = PolicySpec(spec.name + ('/policy-only' if policy_only else '/with-recovery'),
-                               spec.humans, spec.checkpoint)
+        # The BCD expert never uses the recovery fallback: evaluate it once.
+        modes = ([None] if spec.bcd_rule is not None
+                 else [False, True] if args.compare_policy_only else [args.policy_only])
+        for policy_only in modes:
+            suffix = ('' if policy_only is None
+                      else '/policy-only' if policy_only else '/with-recovery')
+            named = PolicySpec(spec.name + suffix, spec.humans, spec.checkpoint, spec.bcd_rule)
             rows.extend(evaluate_marl(
                 named, args.config, args.episodes, args.seed, args.max_steps,
                 args.batch_size, args.chunk_steps, args.stochastic, device,
-                args.progress_every, policy_only, args.recovery_trace,
+                args.progress_every, bool(policy_only), args.recovery_trace,
+                args.maps, args.map_seed,
             ))
     raw_path = args.output_dir / "episodes.csv"
     write_csv(raw_path, rows, FIELDS)
@@ -485,7 +557,9 @@ def main() -> None:
         "config": str(args.config.resolve()), "backend": describe(device),
         "policy_only": args.policy_only, "compare_policy_only": args.compare_policy_only,
         "stochastic": args.stochastic, "elapsed_seconds": time.time() - started,
-        "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve())} for s in specs],
+        "maps": args.maps, "map_seed": args.map_seed,
+        "policies": [s.__dict__ | {"checkpoint": str(s.checkpoint.resolve()) if s.checkpoint else None}
+                     for s in specs],
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Saved raw data, summary and metadata to {args.output_dir}")

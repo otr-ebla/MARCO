@@ -421,7 +421,9 @@ def observation_config(env) -> dict:
                   'critic_crops': env.critic_crops,
                   'known_coverage_obs': env.known_coverage_obs,
                   'critic_coverage': env.critic_coverage,
-                  'wall_cells': env.wall_cells}
+                  'wall_cells': env.wall_cells,
+                  'map_width': env.map_width, 'map_height': env.map_height,
+                  'map_depth': env.map_depth}
     # Persist recovery control settings alongside the observation regime so
     # evaluation/visualisation reproduce the training controller.
     obs_config.update({name: getattr(env, name) for name in (
@@ -519,7 +521,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           num_maps: int | None = None,
           additional_updates: int | None = None,
           obs_mode: str | None = None, algo: str = "mappo",
-          live_plot: bool = True):
+          live_plot: bool = True, bc_coef: float | None = None):
     if policy_mode not in ('end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     if algo not in ('mappo', 'ippo'):
@@ -543,6 +545,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
         train_cfg['num_envs'] = num_envs
     if num_minibatches is not None:
         train_cfg['num_minibatches'] = num_minibatches
+    if bc_coef is not None:
+        train_cfg['bc_coef'] = bc_coef
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
@@ -916,6 +920,9 @@ if __name__ == '__main__':
                         help='When resuming, run exactly this many extra updates')
     parser.add_argument('--no-live-plot', dest='live_plot', action='store_false',
                         help='Do not open the live mean-episode-reward plot window')
+    parser.add_argument('--bc-coef', type=float, default=None,
+                        help='Initial weight of the decaying BC loss towards the BCD expert '
+                             '(overrides train.bc_coef; use with --resume from pretrain_bc)')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -930,4 +937,5 @@ if __name__ == '__main__':
           num_minibatches=args.minibatches,
           policy_mode=args.policy_mode, num_maps=args.maps,
           additional_updates=args.additional_updates,
-          obs_mode=args.obs_mode, algo=args.algo, live_plot=args.live_plot)
+          obs_mode=args.obs_mode, algo=args.algo, live_plot=args.live_plot,
+          bc_coef=args.bc_coef)
