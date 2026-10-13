@@ -521,7 +521,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
           num_maps: int | None = None,
           additional_updates: int | None = None,
           obs_mode: str | None = None, algo: str = "mappo",
-          live_plot: bool = True, bc_coef: float | None = None):
+          live_plot: bool = True, bc_coef: float | None = None, teacher: str | None = None):
     if policy_mode not in ('end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     if algo not in ('mappo', 'ippo'):
@@ -590,7 +590,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     lr_decay      = train_cfg.get('lr_decay',       True)
     lr_actor_0    = train_cfg.get('lr_actor',       3e-4)
     lr_critic_0   = train_cfg.get('lr_critic',      1e-3)
-    # Decaying behaviour cloning towards the BCD expert (see src/pretrain_bc.py).
+    # Decaying behaviour cloning towards the imitation teacher (see src/pretrain_bc.py).
     bc_coef_0     = float(train_cfg.get('bc_coef',      0.0))
     bc_decay      = int(train_cfg.get('bc_decay_updates', 300))
 
@@ -602,10 +602,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
     print(f"Maps: {env.grid_h}x{env.grid_w} cells, sampled independently on reset")
     expert = None
     if bc_coef_0 > 0:
-        from src.envs.bcd_expert import BCDExpert
+        from src.envs.optimal_expert import build_teacher
         pretrain_cfg = config.get('pretrain', {})
-        expert = BCDExpert(env, pretrain_cfg.get('expert', {}))
-        print(f"BC towards the BCD expert: coefficient {bc_coef_0} decaying to 0 "
+        expert = build_teacher(env, pretrain_cfg, teacher)
+        print(f"BC towards the {expert.target_rule} expert: coefficient {bc_coef_0} decaying to 0 "
               f"over {bc_decay} updates")
     rollout = Rollout(mappo, vec_env, expert,
                       bool(pretrain_cfg.get('local_labels', True)) if expert else True)
@@ -921,8 +921,11 @@ if __name__ == '__main__':
     parser.add_argument('--no-live-plot', dest='live_plot', action='store_false',
                         help='Do not open the live mean-episode-reward plot window')
     parser.add_argument('--bc-coef', type=float, default=None,
-                        help='Initial weight of the decaying BC loss towards the BCD expert '
+                        help='Initial weight of the decaying BC loss towards the expert '
                              '(overrides train.bc_coef; use with --resume from pretrain_bc)')
+    parser.add_argument('--teacher', choices=['bcd', 'optimal'], default=None,
+                        help='Expert of the BC term (overrides pretrain.teacher): BCD tour or '
+                             'the exact optimal coverage path (needs env.spawn_cells)')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -938,4 +941,4 @@ if __name__ == '__main__':
           policy_mode=args.policy_mode, num_maps=args.maps,
           additional_updates=args.additional_updates,
           obs_mode=args.obs_mode, algo=args.algo, live_plot=args.live_plot,
-          bc_coef=args.bc_coef)
+          bc_coef=args.bc_coef, teacher=args.teacher)

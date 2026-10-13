@@ -263,6 +263,18 @@ class BCDExpert:
         total = jnp.sum(cost[self.env._robot_ids[None], self._perms], axis=1)
         return self._perms[jnp.argmin(total)]
 
+    def remaining(self, state):
+        """Own cell (N,), memory-covered (N, C), geodesic reach (N, C), the
+        reachable cells memory holds as uncovered (N, C) and whether any is left (N,)."""
+        env = self.env
+        m = state.map_id
+        cells, _, _ = self._cells(state)
+        known_covered = (state.mem_state == COVERED).reshape(env.num_robots, -1)
+        reach = self.dist[m][cells]                                         # (N, C)
+        other = (self.free[m][None] & ~known_covered & (reach < _FAR)
+                 & (jnp.arange(env.num_cells)[None] != cells[:, None]))
+        return cells, known_covered, reach, other, jnp.any(other, axis=1)
+
     def targets(self, state, chunk):
         """(N,) target cell (flat) and whether any work remains for each robot.
 
@@ -276,13 +288,7 @@ class BCDExpert:
         """
         env = self.env
         m = state.map_id
-        n = env.num_robots
-        cells, _, _ = self._cells(state)
-        known_covered = (state.mem_state == COVERED).reshape(n, -1)
-        reach = self.dist[m][cells]                                         # (N, C)
-        other = (self.free[m][None] & ~known_covered & (reach < _FAR)
-                 & (jnp.arange(env.num_cells)[None] != cells[:, None]))
-        active = jnp.any(other, axis=1)
+        cells, known_covered, reach, other, active = self.remaining(state)
         if self.target_rule == 'local':
             rank = self.rank[m]
             gap = jnp.abs(rank[None, :] - jnp.maximum(rank[cells], 0)[:, None])

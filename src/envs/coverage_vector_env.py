@@ -31,7 +31,8 @@ UNKNOWN, OCCUPIED, FREE, COVERED = 0, 1, 2, 3
 # Training defaults; checkpoints persist this complete reward specification.
 # 'local_coverage_v1' is kept only so older checkpoints still evaluate.
 E2E_REWARD_DEFAULTS = {
-    'reward_mode': 'progress',
+    'reward_mode': 'progress',      # 'simple': alpha * new cells - revisit_cost * re-entries of visited cells
+                                    #   - tau - wall_kappa * contact + completion_bonus
     'alpha': 10.0,                  # per newly covered cell
     'coverage_reward_growth': 2.0,  # late cells are worth up to 3x alpha
     'axis_alignment_bonus': 0.0,   # compatibility with earlier checkpoints
@@ -65,6 +66,18 @@ E2E_REWARD_DEFAULTS = {
     'discovery_streak_cap': 10,    # streak length at which the bonus stops growing
 }
 
+
+
+def _total_variation(grid: jax.Array) -> jax.Array:
+    """Discrete isotropic TV of an (H, W) map, sum sqrt(dx^2 + dy^2).
+
+    The map is zero-padded, so a covered cell on the floor edge also counts
+    towards the boundary, as it does next to an interior wall.
+    """
+    p = jnp.pad(grid, 1)
+    dx = p[1:, :-1] - p[:-1, :-1]
+    dy = p[:-1, 1:] - p[:-1, :-1]
+    return jnp.sum(jnp.sqrt(dx * dx + dy * dy))
 
 @struct.dataclass
 class EnvState:
@@ -179,7 +192,7 @@ class MultiRobotCoverageEnv:
         self.omega_max       = float(cfg.get('omega_max',       1.0))
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
         self.reward_mode = cfg.get('reward_mode', 'legacy')
-        if self.reward_mode not in ('legacy', 'local_coverage_v1', 'progress', 'sequential'):
+        if self.reward_mode not in ('legacy', 'local_coverage_v1', 'progress', 'sequential', 'simple'):
             raise ValueError(f'Unknown reward_mode: {self.reward_mode}')
         self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
         self.local_coverage_size = int(cfg.get('local_coverage_size', 5))
@@ -313,6 +326,24 @@ class MultiRobotCoverageEnv:
         self.los_spread_end_fraction = float(cfg.get('los_spread_end_fraction', 0.1))
         self.discovery_streak_bonus = float(cfg.get('discovery_streak_bonus', 0.0))
         self.discovery_streak_cap = int(cfg.get('discovery_streak_cap', 10))
+        # 'simple' mode only: approach_weight per cell of path-length decrease
+        # towards the nearest cell the robot's own map holds as uncovered (an
+        # exploration frontier when it knows none). 0 disables it.
+        self.approach_weight = float(cfg.get('approach_weight', 0.0))
+        # 'simple' mode only: total-variation (TV) terms on the global coverage
+        # grid (Jonnarth et al., ICML 2024, eqs. 2-4). The global term
+        # -tv_global_weight * V(C_t) / sqrt(covered cells) is paid every step;
+        # the incremental term -tv_incremental_weight * (V(C_t) - V(C_t-1)) / 2
+        # rewards a shrinking coverage boundary. 2 is the largest TV change per
+        # cell travelled, the grid analogue of the paper's 2 v_max dt.
+        self.tv_global_weight = float(cfg.get('tv_global_weight', 0.0))
+        # 'simple' mode reads coverage_reward_growth only when set: a new cell is
+        # worth alpha * (1 + growth * coverage before the step), so the last,
+        # hardest cells (corners, wall sides) pay most. Default 0 = flat alpha.
+        self.simple_coverage_growth = float(cfg.get('coverage_reward_growth', 0.0))
+        self.tv_incremental_weight = float(cfg.get('tv_incremental_weight', 0.0))
+        if self.approach_weight < 0.0 or (self.approach_weight > 0.0 and not self.use_memory):
+            raise ValueError('approach_weight must be non-negative and needs obs_mode=memory_comm')
         if self.spread_radius <= 0.0:
             raise ValueError('spread_radius must be positive')
         if (self.los_spread_radius <= 0.0 or self.los_spread_decay_steps <= 0
@@ -347,6 +378,8 @@ class MultiRobotCoverageEnv:
             'fallback_cost': self.fallback_cost,
             'los_spread_weight': self.los_spread_weight,
             'discovery_streak_bonus': self.discovery_streak_bonus,
+            'tv_global_weight': self.tv_global_weight,
+            'tv_incremental_weight': self.tv_incremental_weight,
         }
         negative = [name for name, value in weights.items() if value < 0.0]
         if negative:
@@ -369,7 +402,12 @@ class MultiRobotCoverageEnv:
         self.map_depth = int(cfg.get('map_depth', 3))
         if min(self.map_width, self.map_height) <= 0 or self.map_depth < 0:
             raise ValueError('map_width/map_height must be positive and map_depth non-negative')
-        layouts = create_map_bank(self.num_maps,
+        # wall_bank: precomputed (M, max_walls, 4) wall rectangles on the same
+        # floor (e.g. curriculum stages); replaces the procedural bank.
+        wall_bank = cfg.get('wall_bank')
+        if wall_bank is not None:
+            self.num_maps = len(wall_bank)
+        layouts = create_map_bank(1 if wall_bank is not None else self.num_maps,
                                    seed=int(cfg.get('map_seed', 0)),
                                    width=self.map_width, height=self.map_height,
                                    max_depth=self.map_depth,
@@ -383,7 +421,8 @@ class MultiRobotCoverageEnv:
         self.num_cells = self.grid_h * self.grid_w
 
         # Stack walls for all generated maps (M, max_walls, 4)
-        walls_np = np.stack([l.get_walls() for l in layouts])
+        walls_np = (np.asarray(wall_bank, np.float32) if wall_bank is not None
+                    else np.stack([l.get_walls() for l in layouts]))
         self.walls = jnp.asarray(walls_np)
         self._wall_x0 = self.walls[..., 0]
         self._wall_y0 = self.walls[..., 1]
@@ -399,6 +438,12 @@ class MultiRobotCoverageEnv:
         self.wall_grids   = 1.0 - self.free_masks
         # Label a seen cell enters the belief map with: (M, H*W) int8.
         self._cell_labels = jnp.where(self._free_flat > 0.0, FREE, OCCUPIED).astype(jnp.int8)
+        # floor_bank: optional (M, H, W) bool floor per map. Cells outside it
+        # start in every belief map as known obstacles, like cells beyond the grid.
+        floor_bank = cfg.get('floor_bank')
+        self._initial_memory = jnp.asarray(
+            np.where(floor_bank, UNKNOWN, OCCUPIED) if floor_bank is not None
+            else np.full((self.num_maps, self.grid_h, self.grid_w), UNKNOWN), jnp.int8)
         
         if np.any(self.free_totals < self.num_robots):
             raise RuntimeError("Free space is too small in one of the procedural maps.")
@@ -489,6 +534,19 @@ class MultiRobotCoverageEnv:
         
         # Extract candidates per map and pad them to the max shape so they stack
         cands_list = [centers[fm.ravel() > 0.0] for fm in free_masks_np]
+        # spawn_cells > 0: robots start only from that many fixed cells per map,
+        # drawn from map_seed, so plans that depend on the start (the exact
+        # optimal coverage path) can be computed offline for every episode.
+        self.spawn_cells = int(cfg.get('spawn_cells', 0))
+        if self.spawn_cells > 0:
+            if self.num_humans > 0:
+                raise ValueError('spawn_cells requires num_humans == 0')
+            rng = np.random.default_rng((int(cfg.get('map_seed', 0)), 7919))
+            cands_list = [c[np.sort(rng.choice(len(c), min(self.spawn_cells, len(c)),
+                                                replace=False))] for c in cands_list]
+            self.spawn_cells_np = np.stack([
+                np.stack([c[:, 1] // self.cell_size, c[:, 0] // self.cell_size], -1)
+                for c in cands_list]).astype(np.int32)   # (M, K, 2) (row, col)
         max_cands = max(c.shape[0] for c in cands_list)
         
         padded_cands = []
@@ -933,8 +991,8 @@ class MultiRobotCoverageEnv:
             # Evaluation is safe by default: humans always react to robots.
             # Training explicitly overrides this value with its curriculum.
             ghost_robot_prob = jnp.float32(0.0),
-            mem_state        = jnp.full(
-                (self.num_robots, self.grid_h, self.grid_w), UNKNOWN, jnp.int8
+            mem_state        = jnp.broadcast_to(
+                self._initial_memory[map_id], (self.num_robots, self.grid_h, self.grid_w)
             ),
             lidar            = jnp.zeros((self.num_robots, self.n_rays), jnp.float32),
             last_discovery   = jnp.full((self.num_robots, 2), -1, jnp.int32),
@@ -1256,6 +1314,37 @@ class MultiRobotCoverageEnv:
             revisit_streak=jnp.where(reached, 0, revisit_streak),
             no_progress_steps=jnp.where(reached, 0, no_progress_steps),
         )
+        if self.reward_mode == 'simple':
+            # Only coverage, re-coverage, time, wall contact and completion;
+            # every shaping term above is discarded. Re-coverage is entering a
+            # cell the robot's centre has already visited (`revisited` would
+            # also count cells only pre-covered by the disk's overlap).
+            recovered = visit & (state.visit_counts[ids, rows, cols] > 0)
+            rewards = jnp.where(
+                alive,
+                self.alpha * (1.0 + self.simple_coverage_growth * coverage_before) * num_new
+                - self.revisit_cost * recovered
+                - self.tau - self.wall_kappa * wall_hit
+                + self.completion_bonus * complete,
+                0.0,
+            ).astype(jnp.float32)
+            if self.approach_weight > 0.0:
+                # Both distances use the pre-step field, so covering a cell
+                # never looks like progress lost and loops earn nothing.
+                field = self._known_work_field(state)
+                before = self._work_distance(field, state.robot_positions)
+                after = self._work_distance(field, new_pos)
+                approach = jnp.where((before < 0.5 * _FAR) & (after < 0.5 * _FAR), before - after, 0.0)
+                rewards += jnp.where(alive, self.approach_weight * approach, 0.0)
+            if self.tv_global_weight > 0.0 or self.tv_incremental_weight > 0.0:
+                tv_after = _total_variation(new_grid)
+                tv_global = tv_after / jnp.sqrt(jnp.maximum(jnp.sum(new_grid), 1.0))
+                tv_delta = tv_after - _total_variation(prev_grid)
+                rewards -= jnp.where(
+                    alive,
+                    self.tv_global_weight * tv_global + self.tv_incremental_weight * tv_delta / 2.0,
+                    0.0,
+                )
         return next_state, rewards, terminated, truncated, moved
 
     def _recovery_goals(self, state, requested):

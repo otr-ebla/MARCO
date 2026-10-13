@@ -5,9 +5,12 @@ Usage (from the project root):
     python -m src.visualize_policy
     python -m src.visualize_policy --checkpoint checkpoints/checkpoint_e2e.pkl --episodes 10
     python -m src.visualize_policy --config config/mappo_sequential.yaml --expert [--target-rule tour]
+    python -m src.visualize_policy --config config/single_robot.yaml --optimal [--alpha 1 --beta 1]
+    python -m src.visualize_policy --checkpoint checkpoints/ppo_rl_curriculum/latest.pkl --stage 0
+    python -m src.visualize_policy --config config/single_robot_ppo.yaml --optimal --stage 0
 
 Playback controls: RIGHT or R skips the current episode, SPACE pauses, L toggles
-LiDAR, S changes speed, and ESC quits.
+LiDAR, C toggles the actor crop outline, S changes speed, and ESC quits.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ from src.utils.jax_device import describe, select_device
 # ---------------------------------------------------------------------------
 SCALE      = 80   # pixels per metre
 MARGIN     = 40   # pixel border around the map
-HUD_HEIGHT = 50   # pixels for the stats bar at the bottom
+PANEL_WIDTH = 300  # pixels for the stats column on the right
 FPS        = 30
 POPUP_DURATION_MS = 1300
 
@@ -79,6 +82,10 @@ COLORS = {
     'rh_hit':    (190,  90,  20),
     'timeout':   (210,  35, 180),
     'popup_bg':  ( 22,  22,  22),
+    'plan':      (110, 140, 200),
+    'plan_done': ( 30,  60, 140),
+    'crop':      (235, 200,   0),
+    'crop_ring': (220,  40,  40),
 }
 
 
@@ -94,6 +101,81 @@ def _to_px(x: float, y: float, map_h: float) -> tuple[int, int]:
     """World metres → pygame pixel (top-left origin, y-axis flipped)."""
     return (int(x * SCALE) + MARGIN,
             int((map_h - y) * SCALE) + MARGIN)
+
+
+def _draw_dashed_polygon(surface: pygame.Surface, color: tuple[int, int, int],
+                         corners: list[tuple[float, float]], width: int = 2,
+                         dash: float = 8.0, gap: float = 6.0) -> None:
+    """Closed polygon outline drawn as dashes; corners in pixels."""
+    for (x0, y0), (x1, y1) in zip(corners, corners[1:] + corners[:1]):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length == 0.0:
+            continue
+        ux, uy = (x1 - x0) / length, (y1 - y0) / length
+        t = 0.0
+        while t < length:
+            end = min(t + dash, length)
+            pygame.draw.line(surface, color,
+                             (round(x0 + ux * t), round(y0 + uy * t)),
+                             (round(x0 + ux * end), round(y0 + uy * end)), width)
+            t = end + gap
+
+
+def _draw_dashed_polyline(surface: pygame.Surface, color: tuple[int, int, int],
+                          points: np.ndarray, width: int = 2,
+                          dash: float = 7.0, gap: float = 5.0) -> None:
+    """Open polyline drawn as dashes; points (N, 2) in pixels. The dash phase
+    carries across vertices, since one step is usually shorter than a dash."""
+    period = dash + gap
+    phase = 0.0                       # arc length into the current dash period
+    for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length == 0.0:
+            continue
+        ux, uy = (x1 - x0) / length, (y1 - y0) / length
+        t = 0.0
+        while t < length:
+            if phase < dash:
+                end = min(t + dash - phase, length)
+                pygame.draw.line(surface, color,
+                                 (round(x0 + ux * t), round(y0 + uy * t)),
+                                 (round(x0 + ux * end), round(y0 + uy * end)), width)
+            else:
+                end = min(t + period - phase, length)
+            phase = (phase + end - t) % period
+            t = end
+
+
+def _draw_crops(surface: pygame.Surface, env: MultiRobotCoverageEnv,
+                snap: dict, mh: float) -> None:
+    """Outline each robot's actor crop: the S x S core dashed yellow and,
+    when the crop carries a summary ring (directional or crop_summary), the
+    (S+2) x (S+2) ring averaging everything beyond the core dashed red.
+
+    Memory crops are grid-aligned around the robot's cell; legacy crops are
+    centred on the robot and rotated with its heading.
+    """
+    if env.crop_dim == 0:
+        return
+    cs, size = env.cell_size, env.local_coverage_size
+    ringed = env.crop_summary or env.crop_mode == 'directional'
+    sides = [(size, COLORS['crop'])] + ([(size + 2, COLORS['crop_ring'])] if ringed else [])
+    for i in range(env.num_robots):
+        if not snap['alive'][i]:
+            continue
+        x, y = snap['positions'][i]
+        if env.use_memory:
+            col = min(max(math.floor(x / cs), 0), env.grid_w - 1)
+            row = min(max(math.floor(y / cs), 0), env.grid_h - 1)
+            cx, cy, c, s = (col + 0.5) * cs, (row + 0.5) * cs, 1.0, 0.0
+        else:
+            cx, cy = x, y
+            c, s = math.cos(snap['headings'][i]), math.sin(snap['headings'][i])
+        for side, color in sides:
+            h = 0.5 * side * cs
+            corners = [_to_px(cx + c * dx - s * dy, cy + s * dx + c * dy, mh)
+                       for dx, dy in ((-h, -h), (h, -h), (h, h), (-h, h))]
+            _draw_dashed_polygon(surface, color, corners)
 
 
 def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
@@ -115,6 +197,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         info['coverage_ratio'],
         info['covered_cells'],
         info['total_cells'],
+        info['recoverage'],
         info['timeout'],
         state.wall_hits,
         state.robot_hits,
@@ -123,7 +206,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
     (pos, hdg, human_pos, human_hdg, grid, alive, fallback_active, step, cov_ratio,
-     covered, total, timeout, wall_hits, robot_hits, human_hits,
+     covered, total, recoverage, timeout, wall_hits, robot_hits, human_hits,
      lidar) = jax.device_get(payload)
     snap = {
         'positions':      np.asarray(pos),
@@ -137,6 +220,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         'coverage_ratio': float(cov_ratio),
         'covered_cells':  int(covered),
         'total_cells':    int(total),
+        'recoverage':     float(recoverage),
         'timeout':        bool(timeout),
         'wall_hits':      np.asarray(wall_hits),
         'robot_hits':     np.asarray(robot_hits),
@@ -168,8 +252,8 @@ def _draw_popup(surface: pygame.Surface, popup: dict | None,
     label = font.render(popup['label'], True, popup['color'])
     box = label.get_rect()
     box.inflate_ip(48, 28)
-    box.center = (surface.get_width() // 2,
-                  (surface.get_height() - HUD_HEIGHT) // 2)
+    box.center = ((surface.get_width() - PANEL_WIDTH) // 2,
+                  surface.get_height() // 2)
     shadow = box.move(5, 5)
     pygame.draw.rect(surface, (0, 0, 0), shadow, border_radius=12)
     pygame.draw.rect(surface, COLORS['popup_bg'], box, border_radius=12)
@@ -190,7 +274,13 @@ def _draw_frame(
     speed_label: str = '1×',
     popup: dict | None = None,
     popup_font: pygame.font.Font | None = None,
+    plan: tuple[np.ndarray, int] | None = None,
+    show_crop: bool = False,
+    trails: list[list[np.ndarray]] | None = None,
 ) -> None:
+    """`plan`: optional (waypoints (K, 2) metres, waypoints reached) drawn
+    under the robots, the part already travelled darker. `trails`: optional
+    per-robot positions (metres) since the episode start, drawn dashed."""
     mw = env.grid_w * env.cell_size
     mh = env.grid_h * env.cell_size
     cs = env.cell_size
@@ -236,8 +326,25 @@ def _draw_frame(
         2,
     )
 
+    # -- Planned path --
+    if plan is not None and len(plan[0]) > 1:
+        points = [_to_px(x, y, mh) for x, y in plan[0]]
+        done = max(1, min(plan[1], len(points)))
+        pygame.draw.lines(surface, COLORS['plan'], False, points, 2)
+        if done > 1:
+            pygame.draw.lines(surface, COLORS['plan_done'], False, points[:done], 3)
+
     positions = snap['positions']
     headings  = snap['headings']
+
+    # -- Travelled paths, dashed, from the spawn to the current pose --
+    if trails is not None:
+        for i, trail in enumerate(trails):
+            if len(trail) > 1:
+                pts = np.asarray(trail, dtype=np.float64)
+                px = np.stack([pts[:, 0] * SCALE + MARGIN,
+                               (mh - pts[:, 1]) * SCALE + MARGIN], axis=1)
+                _draw_dashed_polyline(surface, _robot_color(snap, i), px)
 
     # -- Lidar rays (toggle with 'L') --
     if show_lidar and snap['lidar'].size:
@@ -254,6 +361,10 @@ def _draw_frame(
                 tip_px, tip_py = _to_px(x, y, mh)
                 pygame.draw.line(surface, ray_color, (cx, cy), (tip_px, tip_py), 1)
                 pygame.draw.circle(surface, ray_color, (tip_px, tip_py), 3)
+
+    # -- Actor crops (toggle with 'C') --
+    if show_crop:
+        _draw_crops(surface, env, snap, mh)
 
     # -- Robots --
     r_px = max(5, int(env.robot_radius * SCALE))
@@ -287,24 +398,32 @@ def _draw_frame(
             rect = rot_surf.get_rect(center=(cx, cy))
             surface.blit(rot_surf, rect)
 
-    # -- HUD --
-    win_h = surface.get_height()
-    pygame.draw.rect(
-        surface, COLORS['hud_bg'],
-        pygame.Rect(0, win_h - HUD_HEIGHT, surface.get_width(), HUD_HEIGHT),
-    )
-    # Kept to ~107 monospace columns so the key hints survive at the default
-    # window width (map width * SCALE + margins).
-    text = (f"  {label} Step {snap['step']:4d}/{env.max_steps} | "
-            f"Coverage {snap['coverage_ratio']:5.1%} "
-            f"({snap['covered_cells']}/{snap['total_cells']}) | "
-            f"Reward {ep_reward:8.2f} | "
-            f"Speed {speed_label} | "
-            f"[ESC] quit [RIGHT/R] next [SPACE] pause "
-            f"[L] lidar [S] speed")
-    rendered = font.render(text, True, COLORS['hud_text'])
-    top = win_h - HUD_HEIGHT + (HUD_HEIGHT - rendered.get_height()) // 2
-    surface.blit(rendered, (8, top))
+    # -- Stats panel (right column) --
+    win_w, win_h = surface.get_size()
+    left = win_w - PANEL_WIDTH
+    pygame.draw.rect(surface, COLORS['hud_bg'], pygame.Rect(left, 0, PANEL_WIDTH, win_h))
+    hits = (int(np.sum(snap['wall_hits'] > 0.0)), int(np.sum(snap['robot_hits'] > 0.0)),
+            int(np.sum(snap['human_hits'] > 0.0)))
+    stats = [
+        ('Step',       f"{snap['step']}/{env.max_steps}"),
+        ('Coverage',   f"{snap['coverage_ratio']:.1%}"),
+        ('Cells',      f"{snap['covered_cells']}/{snap['total_cells']}"),
+        # cell entries per covered cell; 1.00 = no cell entered twice
+        ('Recoverage', f"{snap['recoverage']:.2f}"),
+        ('Reward',     f"{ep_reward:.2f}"),
+        ('Collisions', f"W{hits[0]} R{hits[1]} H{hits[2]}"),
+        ('Speed',      speed_label),
+    ]
+    lines = [label.strip() or 'Policy', '',
+             *(f"{name:<12}{value:>14}" for name, value in stats), '',
+             '[ESC]     quit', '[RIGHT]   next layout', '[R]       respawn',
+             '[SPACE]   pause', '[L]       lidar', '[C]       crop', '[S]       speed']
+    top = MARGIN
+    line_h = font.get_linesize() + 4
+    for line in lines:
+        if line:
+            surface.blit(font.render(line, True, COLORS['hud_text']), (left + 16, top))
+        top += line_h
 
     _draw_popup(surface, popup, popup_font or font)
 
@@ -352,12 +471,44 @@ class MappoController:
         return state, rewards, terminated, truncated
 
 
+class PpoSingleController:
+    """Single-robot recurrent PPO policy (src.train_ppo_single), mean action.
+
+    Plays the layouts of one curriculum stage: map ids first_map .. first_map + num_layouts - 1.
+    """
+
+    label = 'PPO '
+
+    def __init__(self, env, net, params, observe, hidden_size, first_map, num_layouts, squash=False):
+        from src.train_ppo_single import env_action
+
+        self.observe, self.hidden_size = observe, hidden_size
+        self.first_map, self.num_layouts = first_map, num_layouts
+
+        @jax.jit
+        def policy_step(state, obs, h):
+            h, mean, _, _ = net.apply(params, h[None], obs[None])
+            state, rewards, terminated, truncated = env.step(state, env_action(mean, squash))
+            return state, observe(state), h[0], rewards, terminated, truncated
+
+        self._fn = policy_step
+
+    def reset(self, state):
+        self.h = jnp.zeros(self.hidden_size, jnp.float32)
+        self.obs = self.observe(state)
+        return state
+
+    def step(self, state):
+        state, self.obs, self.h, rewards, terminated, truncated = self._fn(state, self.obs, self.h)
+        return state, rewards, terminated, truncated
+
+
 class ExpertController:
     """BCD expert (src.envs.bcd_expert) driving every robot; no checkpoint needed."""
 
-    def __init__(self, env: MultiRobotCoverageEnv, expert_config: dict):
-        from src.envs.bcd_expert import BCDExpert
-        self.expert = BCDExpert(env, expert_config)
+    def __init__(self, env: MultiRobotCoverageEnv, pretrain_config: dict, teacher: str = 'bcd'):
+        from src.envs.optimal_expert import build_teacher
+        self.expert = build_teacher(env, pretrain_config, teacher)
         self.label = f'BCD expert ({self.expert.target_rule}) '
 
         @jax.jit
@@ -375,6 +526,138 @@ class ExpertController:
     def step(self, state):
         state, self.chunk, rewards, terminated, truncated = self._fn(state, self.chunk)
         return state, rewards, terminated, truncated
+
+
+class OptimalController:
+    """Exact CCPP path (src.envs.optimal_coverage) followed by a holonomic
+    point robot at v_max: each step moves v_max * dt along the cell sequence,
+    and an environment step with a zero command updates coverage at the new
+    pose. Single robot; the path is planned at each reset from the spawn cell.
+
+    The MILP runs in a separate process (HiGHS can hold the GIL for the whole
+    solve) while the window keeps handling events and shows a planning
+    banner, so the viewer never stops responding.
+    """
+
+    def __init__(self, env: MultiRobotCoverageEnv, alpha: float, beta: float,
+                 time_limit: float | None):
+        from src.envs.optimal_coverage import CostWeights, OptimalCoveragePlanner
+        if env.num_robots != 1:
+            raise SystemExit('--optimal plans for one robot: use a config with num_robots: 1')
+        self.env = env
+        self.planner = OptimalCoveragePlanner(env, CostWeights(alpha, beta), time_limit)
+        self.label = 'Optimal CCPP '
+        # The worker imports src.envs, hence JAX: keep it off the accelerator.
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        previous = os.environ.get('JAX_PLATFORMS')
+        os.environ['JAX_PLATFORMS'] = 'cpu'
+        try:
+            self._pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context('spawn'))
+            self._pool.submit(int).result()          # start the worker now
+        finally:
+            if previous is None:
+                os.environ.pop('JAX_PLATFORMS', None)
+            else:
+                os.environ['JAX_PLATFORMS'] = previous
+        hold = jnp.array([[-1.0, 0.0]], jnp.float32)    # v = 0, omega = 0
+
+        @jax.jit
+        def place(state, position, heading):
+            state = state.replace(robot_positions=position[None].astype(jnp.float32),
+                                  robot_headings=jnp.full((1,), heading, jnp.float32))
+            return env.step(state, hold)
+
+        self._fn = place
+
+    def reset(self, state):
+        map_id = int(jax.device_get(state.map_id))
+        start = np.asarray(jax.device_get(state.robot_positions))[0]
+        cell = self.planner.cell(start)
+        print(f' planning from cell {cell} ...', end='', flush=True)
+        result = self._plan(map_id, cell)
+        if result.path is None:
+            raise SystemExit(f'Coverage infeasible: {result.message}')
+        print(f' {result.status}: {result.moves} moves, {result.revisits} revisits, '
+              f'J = {result.cost:g} (lower bound {result.lower_bound:g}), '
+              f'{result.solve_seconds:.1f} s', end='', flush=True)
+        self.label = f'Optimal CCPP [{result.status}] '
+        self.waypoints = self.planner.waypoints(result.path)
+        # Positions every v_max * dt along the polyline and the heading of the
+        # segment being travelled (display only: the robot is holonomic).
+        segment = np.diff(self.waypoints, axis=0)
+        lengths = np.linalg.norm(segment, axis=1)
+        travelled = np.concatenate([[0.], np.cumsum(lengths)])
+        stride = self.env.v_max * self.env.dt
+        steps = max(int(np.ceil(travelled[-1] / stride - 1e-9)), 0)
+        distance = np.minimum(np.arange(1, steps + 1) * stride, travelled[-1])
+        index = np.clip(np.searchsorted(travelled, distance, side='left') - 1,
+                        0, max(len(segment) - 1, 0))
+        if len(segment):
+            along = (distance - travelled[index]) / lengths[index]
+            self.trajectory = self.waypoints[index] + along[:, None] * segment[index]
+            self.headings = np.arctan2(segment[index, 1], segment[index, 0])
+        else:
+            self.trajectory, self.headings = self.waypoints[:0], np.zeros(0)
+        self.reached = index + 1             # waypoints passed at each step
+        self.t = 0
+        return state
+
+    def _plan(self, map_id, cell):
+        """Plan in the worker process; pump window events until it is done."""
+        from src.envs.optimal_coverage import plan_coverage
+        key = (map_id, cell)
+        cache = self.planner._cache
+        if key in cache:
+            return cache[key]
+        future = self._pool.submit(
+            plan_coverage, self.planner.grids[map_id], cell, self.planner.weights,
+            time_limit=self.planner.time_limit, open_moves=self.planner.open_moves[map_id])
+        surface = pygame.display.get_surface()
+        font = pygame.font.SysFont('monospace', 22, bold=True) if surface else None
+        began = time.time()
+        while not future.done():
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN
+                                                 and event.key == pygame.K_ESCAPE):
+                    self.close()
+                    raise SystemExit('\nQuit while planning')
+            if surface is not None:
+                limit = self.planner.time_limit
+                text = (f'Planning optimal path from cell {cell}...  {time.time() - began:4.0f} s'
+                        + (f' / {limit:.0f} s' if limit else ''))
+                banner = font.render(text, True, COLORS['hud_text'])
+                box = banner.get_rect(center=((surface.get_width() - PANEL_WIDTH) // 2,
+                                              surface.get_height() // 2)).inflate(30, 20)
+                pygame.draw.rect(surface, COLORS['popup_bg'], box)
+                surface.blit(banner, banner.get_rect(center=box.center))
+                pygame.display.flip()
+            time.sleep(0.05)
+        cache[key] = future.result()
+        return cache[key]
+
+    def close(self):
+        """Stop the planning worker, also mid-solve."""
+        if self._pool is None:
+            return
+        for worker in list((self._pool._processes or {}).values()):
+            worker.terminate()
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        self._pool = None
+
+    def overlay(self):
+        reached = self.reached[min(self.t, len(self.reached)) - 1] + 1 if self.t else 1
+        return self.waypoints, int(reached)
+
+    def step(self, state):
+        if len(self.trajectory):
+            k = min(self.t, len(self.trajectory) - 1)
+            position, heading = self.trajectory[k], self.headings[k]
+        else:
+            position = np.asarray(jax.device_get(state.robot_positions))[0]
+            heading = float(jax.device_get(state.robot_headings)[0])
+        self.t += 1
+        return self._fn(state, jnp.asarray(position), jnp.float32(heading))
 
 
 def run_episode(
@@ -401,6 +684,7 @@ def run_episode(
     current_free = np.asarray(env.free_mask_np[current_map_id])
 
     snap = _snapshot(env, state, view_state['show_lidar'])
+    trails = [[snap['positions'][i].copy()] for i in range(env.num_robots)]
 
     while True:
         for event in pygame.event.get():
@@ -417,6 +701,8 @@ def run_episode(
                     return ep_reward, True   # new spawn and next procedural layout
                 if event.key == pygame.K_l:
                     view_state['show_lidar'] = not view_state['show_lidar']
+                if event.key == pygame.K_c:
+                    view_state['show_crop'] = not view_state['show_crop']
                 if event.key == pygame.K_s:
                     view_state['speed_idx'] = (
                         view_state['speed_idx'] + 1) % len(SPEED_LEVELS)
@@ -432,9 +718,11 @@ def run_episode(
             popup = None
             view_state['popup'] = None
         
+        overlay = getattr(controller, 'overlay', None)
         _draw_frame(surface, env, current_walls, current_free, snap, font,
                     ep_reward, view_state['show_lidar'],
-                    controller.label, speed_label, popup, popup_font)
+                    controller.label, speed_label, popup, popup_font,
+                    overlay() if overlay else None, view_state['show_crop'], trails)
         pygame.display.flip()
         
         if view_state.get('paused', False):
@@ -446,6 +734,8 @@ def run_episode(
         state, rewards, terminated, truncated = controller.step(state)
         ep_reward += float(jnp.mean(rewards))
         snap = _snapshot(env, state, view_state['show_lidar'])
+        for i in range(env.num_robots):
+            trails[i].append(snap['positions'][i].copy())
 
         if bool(terminated) or bool(truncated):
             outcome = _episode_outcome(snap)
@@ -459,7 +749,8 @@ def run_episode(
             _draw_frame(surface, env, current_walls, current_free, snap, font,
                         ep_reward, view_state['show_lidar'],
                         controller.label, speed_label, view_state.get('popup'),
-                        popup_font)
+                        popup_font, overlay() if overlay else None,
+                        view_state['show_crop'], trails)
             pygame.display.flip()
             if current_fps > 0:
                 clock.tick(current_fps)
@@ -550,8 +841,23 @@ def main() -> None:
     parser.add_argument('--expert', action='store_true',
                         help='Drive the robots with the BCD expert (config pretrain.expert) '
                              'instead of a checkpoint; recovery is disabled')
-    parser.add_argument('--target-rule', choices=['local', 'tour'], default=None,
-                        help='With --expert: override pretrain.expert.target_rule')
+    parser.add_argument('--target-rule', choices=['local', 'tour', 'optimal'], default=None,
+                        help='With --expert: override pretrain.expert.target_rule; "optimal" '
+                             'tracks the exact optimal path of the spawn cell (env.spawn_cells)')
+    parser.add_argument('--optimal', action='store_true',
+                        help='Single robot: follow the exact minimum-cost coverage path '
+                             '(src.envs.optimal_coverage, MILP with HiGHS) as a holonomic point')
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help='With --optimal: weight of the number of moves T')
+    parser.add_argument('--beta', type=float, default=1.0,
+                        help='With --optimal: weight of the revisits R')
+    parser.add_argument('--plan-time-limit', type=float, default=120.0,
+                        help='With --optimal: seconds per plan before the best path is '
+                             'returned with status TIME_LIMIT (0 = no limit)')
+    parser.add_argument('--stage', type=int, default=None,
+                        help='curriculum stage to play (0-based): a src.train_ppo_single checkpoint '
+                             'or config (with --optimal; default 0), or a MAPPO/IL checkpoint '
+                             '(default: the procedural maps)')
     parser.add_argument('--terminate-on-collision',
                         action=argparse.BooleanOptionalAction, default=None,
                         help='Override collision termination; default uses the '
@@ -580,7 +886,21 @@ def main() -> None:
     if args.max_steps > 0:
         env_cfg = {**env_cfg, 'max_steps': args.max_steps}
 
-    if args.expert:
+    if args.optimal:
+        if 'curriculum' in config:
+            # A src.train_ppo_single config: plan on the --stage curriculum maps.
+            env, first_map, num_layouts = _stage_env(args, config)
+        else:
+            if args.wall_cells is not None:
+                env_cfg['wall_cells'] = args.wall_cells
+            env_cfg['fallback_enabled'] = False
+            env = MultiRobotCoverageEnv(env_cfg)
+            first_map, num_layouts = 0, env.num_maps
+        controller = OptimalController(env, args.alpha, args.beta,
+                                       args.plan_time_limit or None)
+        controller.first_map, controller.num_layouts = first_map, num_layouts
+        print(f"Controller: {controller.label.strip()}")
+    elif args.expert:
         from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
         # The training environment: e2e reward weights, the expert in place of recovery.
         env_cfg.update({**E2E_REWARD_DEFAULTS, **config.get('e2e_reward', {})})
@@ -588,14 +908,58 @@ def main() -> None:
             env_cfg['wall_cells'] = args.wall_cells
         env_cfg['fallback_enabled'] = False
         env = MultiRobotCoverageEnv(env_cfg)
-        expert_cfg = dict(config.get('pretrain', {}).get('expert', {}))
-        if args.target_rule is not None:
-            expert_cfg['target_rule'] = args.target_rule
-        controller = ExpertController(env, expert_cfg)
+        pretrain_cfg = dict(config.get('pretrain', {}))
+        pretrain_cfg['expert'] = dict(pretrain_cfg.get('expert', {}))
+        teacher = 'optimal' if args.target_rule == 'optimal' else 'bcd'
+        if args.target_rule in ('local', 'tour'):
+            pretrain_cfg['expert']['target_rule'] = args.target_rule
+        controller = ExpertController(env, pretrain_cfg, teacher)
         print(f"Controller: {controller.label.strip()}")
     else:
-        env, controller = _policy_controller(args, env_cfg, model_cfg, train_cfg, device)
+        with open(args.checkpoint, 'rb') as f:
+            ckpt = pickle.load(f)
+        if 'ppo' in ckpt.get('config', {}):
+            env, controller = _ppo_single_controller(args, ckpt)
+        else:
+            env, controller = _policy_controller(args, env_cfg, model_cfg, train_cfg, device)
     _run_viewer(args, env, controller)
+
+
+def _stage_env(args, cfg):
+    """Env of a src.train_ppo_single config and the map ids of --stage:
+    returns (env, first_map, num_layouts)."""
+    from src.train_ppo_single import build_env
+
+    stage = args.stage or 0
+    stage_limits = cfg.get('curriculum', {}).get('max_steps')
+    if args.max_steps > 0:
+        cfg['env']['max_steps'] = args.max_steps
+    elif stage_limits and cfg['curriculum'].get('enabled'):
+        cfg['env']['max_steps'] = stage_limits[stage]   # the stage's training episode limit
+    if args.terminate_on_collision is not None:
+        cfg['env']['terminate_on_collision'] = args.terminate_on_collision
+    env, maps_per_stage = build_env(cfg)
+    stages = cfg['curriculum']['num_stages']
+    if not 0 <= stage < stages:
+        raise SystemExit(f'--stage must be in [0, {stages - 1}]')
+    return env, stage * maps_per_stage, maps_per_stage
+
+
+def _ppo_single_controller(args, ckpt):
+    """Env and controller from a src.train_ppo_single checkpoint; --config is not used."""
+    from src.train_ppo_single import ActorCritic, make_env_fns
+
+    cfg = ckpt['config']
+    env, first_map, maps_per_stage = _stage_env(args, cfg)
+    _, _, observe = make_env_fns(env, maps_per_stage)
+    m = cfg['model']
+    net = ActorCritic(grid_dim=env.crop_dim, n_rays=env.n_rays, grid_embed=m['grid_embed'],
+                      lidar_embed=m['lidar_embed'], hidden_size=m['hidden_size'],
+                      log_std_min=m['log_std_min'], log_std_max=m['log_std_max'])
+    print(f"Loaded: {args.checkpoint}  (update {ckpt['update']}, "
+          f"trained up to stage {ckpt.get('stage', '?')}); playing stage {args.stage or 0}")
+    return env, PpoSingleController(env, net, ckpt['params'], observe, m['hidden_size'],
+                                    first_map, maps_per_stage, m.get('squash', False))
 
 
 def _policy_controller(args, env_cfg, model_cfg, train_cfg, device):
@@ -606,6 +970,10 @@ def _policy_controller(args, env_cfg, model_cfg, train_cfg, device):
         env_cfg['fallback_enabled'] = False
     print(f"Loaded: {args.checkpoint}  (update {update})")
 
+    if args.stage is not None:
+        from src.envs.curriculum_maps import with_stage_maps
+        env_cfg = with_stage_maps(env_cfg, args.stage)
+        print(f"Playing curriculum stage {args.stage} ({env_cfg['num_maps']} layouts)")
     env = MultiRobotCoverageEnv(env_cfg)
     actor_cfg = dict(lidar_embed=model_cfg.get('lidar_embed', 64),
                      hidden_size=model_cfg.get('hidden_size', 128))
@@ -636,8 +1004,8 @@ def _run_viewer(args, env, controller) -> None:
     # -- Pygame setup --
     mw    = env.grid_w * env.cell_size
     mh    = env.grid_h * env.cell_size
-    win_w = int(mw * SCALE) + 2 * MARGIN
-    win_h = int(mh * SCALE) + 2 * MARGIN + HUD_HEIGHT
+    win_w = int(mw * SCALE) + 2 * MARGIN + PANEL_WIDTH
+    win_h = max(int(mh * SCALE) + 2 * MARGIN, 480)
 
     pygame.init()
     surface = pygame.display.set_mode((win_w, win_h))
@@ -646,15 +1014,17 @@ def _run_viewer(args, env, controller) -> None:
     font  = pygame.font.SysFont('monospace', 15)
     popup_font = pygame.font.SysFont('monospace', 34, bold=True)
 
-    view_state = {'show_lidar': False, 'speed_idx': 0, 'popup': None}
+    view_state = {'show_lidar': False, 'show_crop': False, 'speed_idx': 0, 'popup': None}
     key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
-    map_id = 0
+    first_map = getattr(controller, 'first_map', 0)
+    num_layouts = getattr(controller, 'num_layouts', env.num_maps)
+    map_id = first_map
     try:
         while args.episodes == 0 or ep_num < args.episodes:
             key, ep_key = jax.random.split(key)
-            print(f"Episode {ep_num + 1} (layout {map_id + 1}/{env.num_maps}) ...",
+            print(f"Episode {ep_num + 1} (layout {map_id - first_map + 1}/{num_layouts}) ...",
                   end='', flush=True)
             ret = run_episode(env, controller, ep_key, surface, clock, font,
                                popup_font, args.fps, view_state, map_id)
@@ -665,8 +1035,11 @@ def _run_viewer(args, env, controller) -> None:
             print(f"  total reward = {reward:.2f}")
             ep_num += 1
             if advance_layout:
-                map_id = (map_id + 1) % env.num_maps
+                map_id = first_map + (map_id - first_map + 1) % num_layouts
     finally:
+        close = getattr(controller, 'close', None)
+        if close is not None:
+            close()
         pygame.quit()
 
 

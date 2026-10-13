@@ -1,13 +1,13 @@
 """Single-robot problem: configurable room, observation without teammates,
-and the BCD expert / baseline running on it."""
+no recovery fallback and the simple coverage reward."""
 
 import os
 import unittest
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
-from src.envs.bcd_expert import BCDExpert
 from src.envs.map_layouts import ProceduralMapLayout
 from src.envs.vec_env import VecEnv
 from src.train_marl import build_env_config, observation_config
@@ -43,21 +43,39 @@ class SingleRobotTests(unittest.TestCase):
         _, obs, _, _ = VecEnv(2, cfg).reset(jax.random.PRNGKey(0))
         self.assertEqual(obs.shape, (2, 1, env.obs_dim))
 
-    def test_bcd_tour_visits_every_free_cell_and_acts(self):
-        cfg = {**single_robot_env_config(), 'fallback_enabled': False}
-        vec_env = VecEnv(2, cfg)
-        expert = BCDExpert(vec_env.env, {'target_rule': 'tour'})
-        free = vec_env.env.free_mask_np.reshape(vec_env.env.num_maps, -1) > .5
-        for m in range(vec_env.env.num_maps):
-            tour = expert.tour_np[m][expert.tour_np[m] >= 0]
-            self.assertEqual(sorted(tour.tolist()), np.flatnonzero(free[m]).tolist())
+    def test_no_recovery_fallback(self):
+        env = VecEnv(1, single_robot_env_config()).env
+        self.assertFalse(env.fallback_enabled)
 
-        state, *_ = vec_env.reset(jax.random.PRNGKey(0))
-        actions, chunk, _ = jax.vmap(expert.act)(state, expert.init_chunks((2,)))
-        self.assertEqual(actions.shape, (2, 1, 2))
-        self.assertTrue(np.all(np.abs(np.asarray(actions)) <= 1.))
-        np.testing.assert_array_equal(np.asarray(chunk), 0)   # one robot owns the whole tour
+    def test_simple_reward_terms(self):
+        """r = alpha * new cells - revisit_cost * re-entries of visited cells - tau
+        - wall_kappa * contact + completion_bonus * complete."""
+        cfg = single_robot_env_config()
+        env = VecEnv(1, cfg).env
+        self.assertEqual(env.reward_mode, 'simple')
+        step = jax.jit(env.step)
+        state = env.reset(jax.random.PRNGKey(0))
 
+        def cell(s):
+            return tuple((np.asarray(s.robot_positions[0]) // env.cell_size).astype(int))
+        seen_new = seen_revisit = False
+        # Forward, turn on the spot by ~pi, forward again: back over covered cells.
+        forward, turn = jnp.array([[1., 0.]]), jnp.array([[-1., 1.]])
+        for t in range(600):
+            action = turn if 25 <= t % 80 < 56 else forward   # 31 steps at 1 rad/s ~ pi
+            grid_before, cell_before = np.asarray(state.coverage_grid), cell(state)
+            visits_before = np.asarray(state.visit_counts[0])
+            state, reward, _, _ = step(state, action)
+            new = float(np.asarray(state.coverage_grid).sum() - grid_before.sum())
+            col, row = cell(state)
+            revisit = float((col, row) != cell_before and visits_before[row, col] > 0)
+            wall = float(state.wall_hits[0])
+            expected = (cfg['alpha'] * new - cfg['revisit_cost'] * revisit
+                        - cfg['tau'] - cfg['wall_kappa'] * wall)
+            self.assertAlmostEqual(float(reward[0]), expected, places=4)
+            seen_new |= new > 0
+            seen_revisit |= revisit > 0
+        self.assertTrue(seen_new and seen_revisit)
 
 if __name__ == '__main__':
     unittest.main()

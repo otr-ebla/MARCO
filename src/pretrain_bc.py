@@ -7,9 +7,12 @@
         --resume checkpoints/bc/checkpoint_bc.pkl --save-dir checkpoints/bc_rl
 
 Phase 1, DAgger. Each iteration rolls out the team with every robot executing
-the BCD expert's action with probability beta and the actor's deterministic
-action otherwise; the expert labels every visited state. Beta decays from 1
-to 0, so later data comes from the states the actor itself reaches. The actor
+the expert's action with probability beta and the actor's deterministic
+action otherwise; the expert labels every visited state. The expert is the
+BCD tour (`pretrain.teacher: bcd`) or, for one robot, the exact optimal
+coverage path of the spawn cell (`teacher: optimal`, src.envs.optimal_expert).
+Beta decays from 1 to 0, so later data comes from the states the actor itself
+reaches. The actor
 mean is regressed on the labels (MSE on tanh(mean), the recovery imitation
 loss) over a replay of the last rollouts. Labels that differ from the
 previous command (turns, lane shifts, stops) are up-weighted: the actor sees
@@ -50,6 +53,8 @@ import optax
 from src.algorithms.mappo import (compute_gae, recurrent_actor_sequence, rms_init, rms_normalize,
                                   rms_update)
 from src.envs.bcd_expert import BCDExpert, expert_steps, first_episode_summary
+from src.envs.curriculum_maps import with_stage_maps
+from src.envs.optimal_expert import build_teacher
 from src.envs.vec_env import VecEnv
 from src.train_marl import (Rollout, build_env_config, build_learner, observation_config,
                             save_checkpoint)
@@ -75,7 +80,9 @@ PRETRAIN_DEFAULTS = {
     'local_labels': True,          # imitate only decisions whose target lies inside the actor crop
     'rl_init_std': 0.3,            # pre-tanh exploration std handed to RL (actor init: 1.0)
     'sequence_length': 32,         # recurrent actor: BPTT window, must divide rollout_steps
-    'expert': {},
+    'teacher': 'bcd',              # 'bcd' (BCD tour) or 'optimal' (exact optimal path, single robot)
+    'expert': {},                  # tracker gains, shared by both teachers
+    'optimal': {},                 # src.envs.optimal_expert.PLAN_DEFAULTS
 }
 
 
@@ -392,7 +399,8 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
              num_envs: int | None = None, num_maps: int | None = None,
              bc_iterations: int | None = None, critic_updates: int | None = None,
              expert_only: bool = False, wandb_overrides: dict | None = None,
-             algo: str = 'mappo', policy_mode: str = 'end-to-end') -> None:
+             algo: str = 'mappo', policy_mode: str = 'end-to-end', teacher: str | None = None,
+             stage: int | None = None) -> None:
     if policy_mode not in ('end-to-end', 'end-to-end-memory'):
         raise ValueError(f'Unknown policy mode: {policy_mode}')
     config = load_config(config_path)
@@ -406,6 +414,8 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
         pcfg['bc_iterations'] = bc_iterations
     if critic_updates is not None:
         pcfg['critic_warmup_updates'] = critic_updates
+    if teacher is not None:
+        pcfg['teacher'] = teacher
     device = select_device(backend)
     print(f"Device: {describe(device)}")
 
@@ -413,17 +423,21 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
     bc_config = copy.deepcopy(config)
     env_cfg, reward_weights = build_env_config(bc_config, num_maps)
     env_cfg['fallback_enabled'] = False
+    if stage is not None:
+        env_cfg = with_stage_maps(env_cfg, stage)
     E = int(pcfg['num_envs'])
     vec_env = VecEnv(E, env_cfg)
     env = vec_env.env
     t0 = time.time()
-    expert = BCDExpert(env, pcfg['expert'])
-    print(f"BCD plans for {env.num_maps} maps in {time.time() - t0:.1f}s | "
+    expert = build_teacher(env, pcfg)
+    print(f"Teacher {expert.target_rule}: plans for {env.num_maps} maps in {time.time() - t0:.1f}s | "
           f"obs_dim {env.obs_dim} | envs {E} x robots {env.num_robots}")
 
     eval_env = VecEnv(min(int(pcfg['eval_envs']), env.num_maps), env_cfg)
     rl_config = copy.deepcopy(config)
     rl_env_cfg, _ = build_env_config(rl_config, num_maps)
+    if stage is not None:
+        rl_env_cfg = with_stage_maps(rl_env_cfg, stage)
     rl_eval_env = VecEnv(eval_env.E, rl_env_cfg)
     eval_maps = _map_ids(eval_env.E, env.num_maps)
     eval_key = jax.random.PRNGKey(12345)
@@ -629,7 +643,7 @@ def pretrain(config_path: str, save_dir: str, backend: str | None = None,
 
 if __name__ == '__main__':
     _default_cfg = os.path.join(os.path.dirname(__file__), '..', 'config', 'mappo_sequential.yaml')
-    parser = argparse.ArgumentParser(description='BCD imitation pre-training and critic warm-up')
+    parser = argparse.ArgumentParser(description='Imitation pre-training (BCD or optimal teacher) and critic warm-up')
     parser.add_argument('--config', default=_default_cfg)
     parser.add_argument('--save-dir', default=os.path.join(os.path.dirname(__file__), '..',
                                                            'checkpoints', 'bc'))
@@ -642,6 +656,12 @@ if __name__ == '__main__':
     parser.add_argument('--algo', choices=['mappo', 'ippo'], default='mappo')
     parser.add_argument('--policy-mode', choices=['end-to-end', 'end-to-end-memory'],
                         default='end-to-end', help='end-to-end-memory clones a GRU actor on sequences')
+    parser.add_argument('--teacher', choices=['bcd', 'optimal'], default=None,
+                        help='Expert to imitate (overrides pretrain.teacher): BCD tour or the exact '
+                             'optimal coverage path (single robot, needs env.spawn_cells)')
+    parser.add_argument('--stage', type=int, default=None,
+                        help='Train only on the maps of this curriculum stage (src.envs.curriculum_maps; '
+                             '0 = small empty room)')
     parser.add_argument('--expert-only', action='store_true',
                         help='Only evaluate the expert on every map and exit')
     parser.add_argument('--wandb', dest='wandb_enabled', action='store_true', default=None)
@@ -652,4 +672,4 @@ if __name__ == '__main__':
     pretrain(args.config, args.save_dir, None if args.backend == 'auto' else args.backend,
              args.envs, args.maps, args.bc_iterations, args.critic_updates, args.expert_only,
              {'enabled': args.wandb_enabled, 'name': args.wandb_name, 'group': args.wandb_group},
-             args.algo, args.policy_mode)
+             args.algo, args.policy_mode, args.teacher, args.stage)

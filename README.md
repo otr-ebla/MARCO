@@ -98,18 +98,20 @@ each rollout chunk.
 ## 🤖 Single-robot baseline study
 
 A simplified problem with **one robot** in smaller rooms (8 m × 6 m, up to four
-rooms), the same local observation without communication, and the same coverage
-objective. It compares four methods on identical seeds and unseen layouts:
-centralised **BCD** (Boustrophedon Cellular Decomposition, map known in advance),
-**IL** (DAgger imitation of BCD), **RL** (PPO from scratch) and **IL+RL**
-(imitation, then PPO with a decaying BC term).
+rooms), the same local observation without communication, no recovery fallback and
+a simple reward (new cells, a re-coverage cost, a time cost, a wall-contact cost,
+a completion bonus).
+It compares four methods on identical seeds and unseen layouts: the **optimal**
+coverage path (solved exactly as a MILP with HiGHS by `src/envs/optimal_coverage.py`,
+map known in advance), **IL** (DAgger imitation of the optimal path), **RL** (PPO
+from scratch) and **IL+RL** (imitation, then PPO with a decaying BC term).
 
 ```bash
 bash scripts/single_robot_experiments.sh --backend cuda
 ```
 
-Configuration in `config/single_robot.yaml`; details, individual commands and
-reference BCD numbers in [`docs/single_robot.md`](docs/single_robot.md).
+Configuration in `config/single_robot.yaml`; details and individual commands in
+[`docs/single_robot.md`](docs/single_robot.md).
 
 ---
 

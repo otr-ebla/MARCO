@@ -1,0 +1,116 @@
+# Fine-tune of a run that already completes stage 0: harsher revisit and wall costs, lower LR.
+# Single-robot coverage with recurrent PPO (src.train_ppo_single).
+#
+# Observation per step (flat vector, in this order):
+#   7x7 grid from the robot's own lidar-built map, channels [obstacle, covered, robots]:
+#     inner 5x5 = the sensed cells around the robot (1 m horizon at 0.5 m cells);
+#     outer ring = per channel, the mean over all cells beyond the 5x5 in that
+#     direction (up / down / left / right), divided by the number of in-map cells
+#     lying beyond on that side; corners 0. 'robots' is always 0 with one robot.
+#   lidar   n_rays distances normalised by max_lidar_range
+#   [v, omega] current velocities normalised by v_max / omega_max
+#   [x, y, theta] global pose: x / map_width, y / map_height, theta / pi in [-1, 1]
+# Action: tanh of a Gaussian sample, [v, omega] in [-1, 1], scaled by the env to [0, v_max] x [-omega_max, omega_max].
+# Network: grid MLP + lidar MLP + kinematics + pose -> GRU -> actor (mean, log_std), critic (value).
+env:
+  num_robots: 1
+  num_humans: 0
+  num_maps: 64                 # procedural bank, used only with the curriculum off
+  map_seed: 0
+  map_width: 8.0               # metres -> 16 x 12 cells
+  map_height: 6.0
+  map_depth: 2                 # BSP depth: up to four rooms joined by doorways
+  spawn_cells: 0               # any free cell; set 8 (curriculum off) to match the optimal baseline starts
+  n_rays: 70
+  max_lidar_range: 5.0
+  cell_size: 0.5
+  wall_cells: 1
+  sensing_radius: 5.0
+  robot_radius: 0.20
+  coverage_overlap: 1.0        # a cell is covered only when the robot centre enters it
+  dt: 0.1
+  max_steps: 4000              # ceiling; the curriculum sets a shorter limit per stage
+  v_max: 1.0
+  omega_max: 1.0
+  terminate_on_collision: false # a wall hit blocks the move and costs wall_kappa; the episode goes on
+  obs_mode: memory_comm        # per-robot lidar-built map feeds the grid crop
+  crop_mode: directional       # 5x5 core + directional mean ring = 7x7
+  local_coverage_size: 5
+  fallback_enabled: false
+  comm_radius: 0.0
+  comm_slots: 0
+  observation_stack: 1
+  critic_stack: 1
+
+# Reward per step (env reward_mode 'simple'):
+#   +alpha * (1 + coverage_reward_growth * coverage) per newly covered cell, -revisit_cost per entry into an already visited cell,
+#   -tau per step, -wall_kappa per wall contact (the move is blocked, the episode goes on),
+#   +completion_bonus when every free cell is covered (episode ends),
+#   +approach_weight per cell of path-length decrease towards the nearest cell the
+#    robot's own map holds as uncovered (an exploration frontier if it knows none).
+reward:
+  reward_mode: simple
+  alpha: 1.0
+  coverage_reward_growth: 2.0  # the last cells (mostly corners) are worth up to 3 x alpha
+  revisit_cost: 0.4            # fine-tune: was 0.1
+  tau: 0.01
+  wall_kappa: 2.5              # fine-tune: was 1.0
+  completion_bonus: 500.0
+  approach_weight: 0.2         # small next to +1 per new cell; driving away costs the same amount
+  # Total variation of the coverage grid (Jonnarth et al., ICML 2024): penalises
+  # holes and stripes left beside covered ground. 0 disables a term.
+  #   global:      -tv_global_weight * TV(C_t) / sqrt(covered cells)   (~4 for a compact patch)
+  #   incremental: -tv_incremental_weight * (TV(C_t) - TV(C_t-1)) / 2
+  # Keep both well below alpha, or standing still beats covering.
+  tv_global_weight: 0.002       # ~0.008 per step on a compact patch, next to tau 0.01
+  tv_incremental_weight: 0.2    # a cell leaving a one-cell gap costs ~0.2, next to alpha 1
+
+# Curriculum (src/envs/curriculum_maps.py), on the same 16 x 12 cell floor:
+#   0 small empty room, 1 full floor empty, 2 full floor + 3-5 obstacles,
+#   3 two to four BSP rooms with doorways + 2-4 obstacles.
+# Promotion: >= success_rate of the last `window` episodes of the current stage
+# reach >= success_coverage with at most max_contacts wall contacts and recoverage (robot
+# centre entries per covered cell) <= max_recoverage. With 4096 envs a few hundred
+# episodes end per update, so the window must span several updates. Maps are generated once at startup (NumPy); a reset
+# only draws an index from the current stage, so it costs nothing.
+curriculum:
+  enabled: true
+  maps_per_stage: 256
+  max_walls: 16
+  start_stage: 0
+  window: 2000
+  success_coverage: 0.95
+  max_contacts: 2
+  max_recoverage: 1.5          # 1.0 = no cell entered twice
+  success_rate: 0.8
+  max_steps: [1500, 2500, 3000, 4000]   # episode limit per stage (stage 0 rooms have <= 64 cells)
+
+model:
+  grid_embed: 64
+  lidar_embed: 64
+  hidden_size: 128             # GRU state
+  log_std_min: -5.0
+  log_std_max: 1.0
+  squash: true                 # action = tanh(Gaussian); false = clip (pre-squash checkpoints)
+
+ppo:
+  num_envs: 4096
+  rollout_steps: 128           # also the BPTT length of the GRU
+  total_timesteps: 1.0e+9
+  lr: 1.0e-4                   # fine-tune: was 3e-4, the policy already completes
+  anneal_lr: true
+  gamma: 0.999                 # ~1000-step horizon: the completion bonus stays visible
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  ent_coef: 0.005
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  update_epochs: 4
+  num_minibatches: 8           # split over the env axis, full sequences each
+  reward_scale: 0.1            # training-only scale; logged returns are raw
+  bootstrap_truncation: true   # a time-limit end bootstraps from V instead of counting as terminal
+  log_interval: 10
+  save_interval: 100
+
+wandb:
+  project: mrcpp-single

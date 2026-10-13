@@ -6,7 +6,8 @@
         --checkpoint checkpoints/single/rl/checkpoint_e2e_memory.pkl --label RL
 
 `--bcd tour` adds classical centralised Boustrophedon Cellular Decomposition
-(planned on the known map) as a baseline, run on the same seeds and maps.
+(planned on the known map) as a baseline, run on the same seeds and maps;
+`--optimal` adds the exact optimal coverage path (single robot).
 
 Each checkpoint is evaluated for `--episodes` episodes in compiled accelerator
 batches. Raw episode data, aggregate statistics and run metadata are written to
@@ -66,7 +67,7 @@ class PolicySpec:
     name: str
     humans: int
     checkpoint: Path | None = None
-    bcd_rule: str | None = None   # BCD expert instead of a checkpoint: 'tour' or 'local'
+    bcd_rule: str | None = None   # expert instead of a checkpoint: 'tour', 'local' or 'optimal'
 
 
 def _env_config(path: Path, humans: int, max_steps: int | None,
@@ -89,16 +90,22 @@ def _bcd_policy(spec: PolicySpec, config: dict, env_cfg: dict, batch: int):
     'tour' is classical centralised BCD: the decomposition and the tour are
     planned offline on the true map and the robot follows the first cell of
     the tour it has not covered. 'local' is the memory-driven variant (nearest
-    uncovered cell). The expert has its own safety filter, so the recovery
-    fallback is off.
+    uncovered cell). 'optimal' tracks the exact optimal coverage path of the
+    spawn cell (src.envs.optimal_expert) with the same controller. The expert
+    has its own safety filter, so the recovery fallback is off.
     """
     from src.envs.bcd_expert import BCDExpert
     from src.envs.coverage_vector_env import E2E_REWARD_DEFAULTS
+    from src.envs.optimal_expert import build_teacher
     env_cfg.update({**E2E_REWARD_DEFAULTS, **config.get("e2e_reward", {})})
     env_cfg["fallback_enabled"] = False
     vec_env = VecEnv(batch, env_cfg)
-    expert_cfg = {**config.get("pretrain", {}).get("expert", {}), "target_rule": spec.bcd_rule}
-    expert = BCDExpert(vec_env.env, expert_cfg)
+    pretrain_cfg = config.get("pretrain", {})
+    if spec.bcd_rule == "optimal":
+        expert = build_teacher(vec_env.env, pretrain_cfg, "optimal")
+    else:
+        expert_cfg = {**pretrain_cfg.get("expert", {}), "target_rule": spec.bcd_rule}
+        expert = BCDExpert(vec_env.env, expert_cfg)
     act = jax.vmap(expert.act)
 
     def policy(state, obs, chunk, key):
@@ -488,6 +495,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bcd", choices=("tour", "local"), action="append", default=[],
                         help="also evaluate the BCD expert: 'tour' = centralised BCD planned "
                              "on the known map, 'local' = nearest uncovered cell in memory")
+    parser.add_argument("--optimal", action="store_true",
+                        help="also evaluate the exact optimal coverage path (MILP, single robot, "
+                             "env.spawn_cells > 0) tracked by the differential-drive controller")
     parser.add_argument("--maps", type=int, default=None,
                         help="evaluation map-bank size (overrides env.num_maps)")
     parser.add_argument("--map-seed", type=int, default=None,
@@ -517,8 +527,8 @@ def main() -> None:
         raise SystemExit("episodes, batch-size and chunk-steps must be positive; humans cannot be negative")
     device = select_device(None if args.backend == "auto" else args.backend)
     print(f"Device: {describe(device)}")
-    if not args.checkpoint and not args.bcd:
-        raise SystemExit("Give at least one --checkpoint or --bcd")
+    if not args.checkpoint and not args.bcd and not args.optimal:
+        raise SystemExit("Give at least one --checkpoint, --bcd or --optimal")
     labels = args.label or [f"{c.parent.name}/{c.name}" for c in args.checkpoint]
     if len(labels) != len(args.checkpoint):
         raise SystemExit("Give one --label per --checkpoint, or none")
@@ -526,6 +536,8 @@ def main() -> None:
              for label, path in zip(labels, args.checkpoint)]
     specs += [PolicySpec(f"BCD ({rule})", args.humans, bcd_rule=rule)
               for rule in dict.fromkeys(args.bcd)]
+    if args.optimal:
+        specs.append(PolicySpec("Optimal (MILP)", args.humans, bcd_rule="optimal"))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.recovery_trace is not None:
         args.recovery_trace.parent.mkdir(parents=True, exist_ok=True)
@@ -537,7 +549,7 @@ def main() -> None:
         modes = ([None] if spec.bcd_rule is not None
                  else [False, True] if args.compare_policy_only else [args.policy_only])
         for policy_only in modes:
-            suffix = ('' if policy_only is None
+            suffix = ('' if policy_only is None or not args.compare_policy_only
                       else '/policy-only' if policy_only else '/with-recovery')
             named = PolicySpec(spec.name + suffix, spec.humans, spec.checkpoint, spec.bcd_rule)
             rows.extend(evaluate_marl(
